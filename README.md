@@ -24,3 +24,12 @@ versiobn of figure/track
 should be present in form of comments
 - The code should also contain the author, date of creation and date of last
 update in the header
+
+# Figure code generation
+
+Figure 1
+Figure 2
+Figure 3
+Figure 4
+Figure 5
+Figure 6
