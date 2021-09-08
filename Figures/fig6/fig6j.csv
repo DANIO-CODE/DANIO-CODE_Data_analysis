@@ -1,0 +1,9 @@
+signal	n_bins	label
+zebrafish	5476	ensemble
+mouse	844	ensemble
+both	2151	ensemble
+none	2612	ensemble
+zebrafish	10165	non-ensemble
+mouse	14799	non-ensemble
+both	3029	non-ensemble
+none	65027	non-ensemble

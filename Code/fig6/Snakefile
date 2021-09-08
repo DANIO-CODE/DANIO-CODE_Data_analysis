@@ -308,21 +308,41 @@ rule download_mouse_data:
     output:
         h3k27me3='{bam_dir}/H3K27me3_mm10_multiTissue_E10.5.bam',
         dnase='{bam_dir}/DNase_mm10_multiTissue_E10.5.bam'
-     shell:
+    shell:
         '%s/download_and_process_mouse_data.sh' %code_dir
 
-# rule chromhmm_binarize_bam:
-#     input:
-#         sizes=,
-#         bam_dir=,
-#         cellmarkfiletable=,
-#         binary_bam_out=
-#     output:
-#         '{chromhmm_dir}/danRer10/prim5_chromHMM.bed',
-#         '{chromhmm_dir}/{build}/chromHMM_out/multiTissue_10_dense.bed'
-#     threads:
-#         min(workflow.cores, 30)
-#     params:
-#         chromhmm_cmd='java -mx10G -jar ChromHMM.jar'
-#     shell:
-#         '{params.chromhmm_cmd} BinarizeBam {input}'
+rule chromhmm_BinarizeBam:
+    input:
+        sizes='{data_dir}/assembly/mm10.sizes',
+        cellmarkfiletable='{data_dir}/chromHMM/mm10/cellmarkfiletable.txt',
+    output:
+        bam_dir=directory('{data_dir}/chromHMM/mm10/bam'),
+        binary_bam_out_dir=directory('{data_dir}/chromHMM/mm10/binary_bam_out'),
+        binary_files=['{data_dir}/chromHMM/mm10/binary_bam_out/multiTissue_chr%s_binary.txt' %x for x in range(1,20)]
+    threads:
+        min(workflow.cores, 30)
+    params:
+        chromhmm_cmd='java -mx10G -jar ChromHMM.jar'
+    shell:
+        '''
+        mkdir -p {input.bam_dir} {input.binary_bam_out_dir}
+        {params.chromhmm_cmd} BinarizeBam {input.sizes} {output.bam_dir} {input.cellmarkfiletable} {output.binary_bam_out_dir}
+        '''
+
+rule chromhmm_LearnModel:
+    input:
+        binary_bam_out_dir='{data_dir}/chromHMM/mm10/binary_bam_out'
+    output:
+        chromhmm_out_dir='{data_dir}/chromHMM/mm10/chromHMM_out',
+        segmentation='{data_dir}/chromHMM/mm10/chromHMM_out/mm10_multiTissue_E10.5_10_dense.bed'
+    params:
+        chromhmm_cmd='java -mx10G -jar ChromHMM.jar',
+        nstates=10,
+        build='mm10'
+    threads:
+        min(workflow.cores, 50)
+    shell:
+        '''
+        mkdir -p {output.chromhmm_out_dir}
+        {params.chromhmm_cmd} LearnModel -p {threads} -printposterior -printstatebyline {input.binary_bam_out_dir} {output.chromhmm_out_dir} {params.nstates} {params.build}
+        '''
