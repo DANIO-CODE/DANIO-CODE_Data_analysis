@@ -308,16 +308,21 @@ rule download_mouse_data:
     output:
         h3k27me3='{bam_dir}/H3K27me3_mm10_multiTissue_E10.5.bam',
         dnase='{bam_dir}/DNase_mm10_multiTissue_E10.5.bam'
-    shell:
+     shell:
         '%s/download_and_process_mouse_data.sh' %code_dir
 
-### CONTINUE HERE: ChromHMM
-rule chromhmm:
-    input:
-    output:
-        '{chromhmm_dir}/danRer10/prim5_chromHMM.bed',
-        '{chromhmm_dir}/mm10/chromHMM_out/multiTissue_10_dense.bed'
-    threads:
-        min(workflow.cores, 30)
-    shell:
-        ''
+# rule chromhmm_binarize_bam:
+#     input:
+#         sizes=,
+#         bam_dir=,
+#         cellmarkfiletable=,
+#         binary_bam_out=
+#     output:
+#         '{chromhmm_dir}/danRer10/prim5_chromHMM.bed',
+#         '{chromhmm_dir}/{build}/chromHMM_out/multiTissue_10_dense.bed'
+#     threads:
+#         min(workflow.cores, 30)
+#     params:
+#         chromhmm_cmd='java -mx10G -jar ChromHMM.jar'
+#     shell:
+#         '{params.chromhmm_cmd} BinarizeBam {input}'
