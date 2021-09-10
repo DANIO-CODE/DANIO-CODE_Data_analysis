@@ -114,7 +114,7 @@ rule fig6g:
 
 rule fig6h:
     input:
-        chromhmm_mm=ancient('%s/chromHMM/mm10/chromHMM_out/multiTissue_10_dense.bed' %data_dir),
+        chromhmm_mm=ancient('%s/chromHMM/mm10/chromHMM_out/mm10_multiTissue_E10.5_10_dense.bed' %data_dir),
         atac_zf=ancient('%s/projection/ATAC_danRer10_prim5_summits.inTAD.proj' %data_dir),
         aln=ancient('%s/alignment/danRer10.mm10.net.axt.bed' %data_dir),
         chromhmm_zf=ancient('%s/chromHMM/danRer10/prim5_chromHMM.bed' %data_dir)
@@ -311,32 +311,41 @@ rule download_mouse_data:
     shell:
         '%s/download_and_process_mouse_data.sh' %code_dir
 
-rule chromhmm_BinarizeBam:
-    input:
-        sizes='{data_dir}/assembly/mm10.sizes',
-        cellmarkfiletable='{data_dir}/chromHMM/mm10/cellmarkfiletable.txt',
+rule download_and_unzip_chromhmm:
     output:
-        bam_dir=directory('{data_dir}/chromHMM/mm10/bam'),
-        binary_bam_out_dir=directory('{data_dir}/chromHMM/mm10/binary_bam_out'),
-        binary_files=['{data_dir}/chromHMM/mm10/binary_bam_out/multiTissue_chr%s_binary.txt' %x for x in range(1,20)]
-    threads:
-        min(workflow.cores, 30)
-    params:
-        chromhmm_cmd='java -mx10G -jar ChromHMM.jar'
+        zip=temp('{code_dir}/ChromHMM.zip'),
+        jar='{code_dir}/ChromHMM/ChromHMM.jar'
     shell:
         '''
-        mkdir -p {input.bam_dir} {input.binary_bam_out_dir}
-        {params.chromhmm_cmd} BinarizeBam {input.sizes} {output.bam_dir} {input.cellmarkfiletable} {output.binary_bam_out_dir}
+        wget -O {output.zip} http://compbio.mit.edu/ChromHMM/ChromHMM.zip
+        unzip {output.zip} -d {wildcards.code_dir}
+        '''
+        
+rule chromhmm_BinarizeBam:
+    input:
+        bam_dir='{data_dir}/bam',
+        jar='%s/ChromHMM/ChromHMM.jar' %code_dir,
+        sizes=ancient('{data_dir}/assembly/mm10.sizes'),
+        cellmarkfiletable=ancient('{data_dir}/chromHMM/mm10/cellmarkfiletable.txt'),
+    output:
+        binary_bam_out_dir=directory('{data_dir}/chromHMM/mm10/binary_bam_out'),
+        binary_files=['{data_dir}/chromHMM/mm10/binary_bam_out/mm10_multiTissue_E10.5_chr%s_binary.txt' %x for x in range(1,20)]
+    threads:
+        min(workflow.cores, 50)
+    shell:
+        '''
+        mkdir -p {output.binary_bam_out_dir}
+        java -mx10G -jar {input.jar} BinarizeBam {input.sizes} {input.bam_dir} {input.cellmarkfiletable} {output.binary_bam_out_dir}
         '''
 
 rule chromhmm_LearnModel:
     input:
+        jar='%s/ChromHMM/ChromHMM.jar' %code_dir,
         binary_bam_out_dir='{data_dir}/chromHMM/mm10/binary_bam_out'
     output:
-        chromhmm_out_dir='{data_dir}/chromHMM/mm10/chromHMM_out',
+        chromhmm_out_dir=directory('{data_dir}/chromHMM/mm10/chromHMM_out'),
         segmentation='{data_dir}/chromHMM/mm10/chromHMM_out/mm10_multiTissue_E10.5_10_dense.bed'
     params:
-        chromhmm_cmd='java -mx10G -jar ChromHMM.jar',
         nstates=10,
         build='mm10'
     threads:
@@ -344,5 +353,5 @@ rule chromhmm_LearnModel:
     shell:
         '''
         mkdir -p {output.chromhmm_out_dir}
-        {params.chromhmm_cmd} LearnModel -p {threads} -printposterior -printstatebyline {input.binary_bam_out_dir} {output.chromhmm_out_dir} {params.nstates} {params.build}
+        java -mx10G -jar {input.jar} LearnModel -p {threads} -printposterior -printstatebyline {input.binary_bam_out_dir} {output.chromhmm_out_dir} {params.nstates} {params.build}
         '''
