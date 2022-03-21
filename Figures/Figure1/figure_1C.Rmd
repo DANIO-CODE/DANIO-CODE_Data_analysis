@@ -1,0 +1,302 @@
+---
+title: "Figure 1C and supplementary Figure 1"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r message=FALSE}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+# library(reshape2)
+library(ggsci)
+# library(tidyverse)
+# library(scales)
+```
+
+Import annotations (=all fastq files from series with processed files attached)
+```{r}
+data <- read_delim("DCC-annotations-2021-05.csv", col_names = TRUE, quote = "\"", delim = ";", col_types = cols(), guess_max = 10000)
+data <- data[data$file_type=="FASTQ",] #remove entries for processed files
+```
+Define stages and assay types for axes
+```{r}
+ref_types <- data.frame(
+  "types" = c(
+    "BS/MethylC-seq",
+    "MeDIP-seq",
+    "MethylCap-seq",
+    "RRBS",
+    "TAB-seq",
+    "4C-seq",
+    "ATAC-seq",
+    "ChIP-seq",
+    "DNAse-seq",
+    "Hi-C",
+    "MNase-seq",
+    "3P-seq",
+    "CAGE-seq",
+    "mRNA-seq",
+    "miRNA-seq",
+    "PAL-seq",
+    "Ribo-seq",
+    "small-RNA-seq",
+    "RNA-seq",
+    "SAPAS"
+  ),
+  "groups" = factor(c(rep("methylation", 5), 
+                      rep("chromatin", 6), 
+                      rep("expression", 9)
+                      ), 
+                    levels = c("methylation", "chromatin", "expression"))
+)
+ref_stages <- data.frame(stages=c(
+  "1-cell",
+  "2-cell",
+  "4-cell",
+  "8-cell",
+  "16-cell",
+  "32-cell",
+  "64-cell",
+  "128-cell",
+  "256-cell",
+  "512-cell",
+  "1k-cell",
+  "High",
+  "Oblong",
+  "Sphere",
+  "Dome",
+  "30%-epiboly",
+  "50%-epiboly",
+  "Germ-ring",
+  "Shield",
+  "75%-epiboly",
+  "90%-epiboly",
+  "Bud",
+  "1-4 somites",
+  "5-9 somites",
+  "10-13 somites",
+  "14-19 somites",
+  "20-25 somites",
+  "26+ somites",
+  "Prim-5",
+  "Prim-15",
+  "Prim-25",
+  "High-pec",
+  "Long-pec",
+  "Pec-fin",
+  "Protruding-mouth",
+  "Day 4",
+  "Day 5",
+  "Day 6",
+  "Days 7-13",
+  "Days 14-20",
+  "Days 21-29",
+  "Days 30-44",
+  "Days 45-89",
+  "90 Days-2 Years"
+), stringsAsFactors=FALSE)
+# merge manually stages
+ref_stages$merged_stages=c(
+                rep(paste(ref_stages$stages[1],ref_stages$stages[2],ref_stages$stages[3],sep="/"),3),
+               ref_stages$stages[4],
+               rep(paste(ref_stages$stages[5],ref_stages$stages[6],sep="/"),2),
+               ref_stages$stages[7],
+               rep(paste(ref_stages$stages[8],ref_stages$stages[9],sep="/"),2),
+               ref_stages$stages[10],
+               rep(paste(ref_stages$stages[11],ref_stages$stages[12],sep="/"),2),
+               ref_stages$stages[13:14],
+               rep(paste(ref_stages$stages[15],ref_stages$stages[16],sep="/"),2),
+               rep(paste(ref_stages$stages[17],ref_stages$stages[18],sep="/"),2),
+               ref_stages$stages[20],
+               rep(paste(ref_stages$stages[20],ref_stages$stages[21],sep="/"),2),
+               ref_stages$stages[22],
+               rep("1-13 somites",3),
+               ref_stages$stages[26],
+               rep(paste(ref_stages$stages[27],ref_stages$stages[28],sep="/"),2),
+               ref_stages$stages[29],
+               rep(paste(ref_stages$stages[30],ref_stages$stages[31],sep="/"),2),
+               ref_stages$stages[32:35],
+               rep(paste(ref_stages$stages[36],ref_stages$stages[37],sep="/"),2),
+               ref_stages$stages[38:44]
+               )
+```
+
+Add assay group column
+```{r}
+data$assay_type[data$assay_type=="BS-seq"] <- "BS/MethylC-seq"
+data$assay_type[data$assay_type=="MethylC-seq"] <- "BS/MethylC-seq"
+data$assay_group <- ref_types$groups[match(data$assay_type, ref_types$types)]
+```
+
+Reshape data for plot
+```{r}
+data_gp <- data %>% group_by(stage, assay_type, assay_group) %>% tally() %>% filter(!stage == "no value")
+# data_gp <- data_gp %>% group_by(assay_type) %>% filter(n() >= 2 | assay_type == "4C-seq")
+data_gp_ip <- data %>% group_by(stage, assay_type, assay_target) %>% tally() %>% filter(!is.na(assay_target))
+```
+
+Prepare chip-seq data (split into data for histone marks and for transcription factors)
+```{r}
+data_gp_chip <- data_gp_ip %>% filter(assay_type == "ChIP-seq")
+data_gp_chip$assay_group <- factor("chromatin", levels = c("methylation", "chromatin", "expression"))
+data_gp_chip_target <- data_gp_chip %>%
+  filter(grepl("^H2|^H3",assay_target)) %>%
+  unite(assay_type, assay_type, assay_target, sep="-")
+data_gp_chip_tf <- data_gp_chip %>%
+  filter(!grepl("^H2|^H3",assay_target)) %>%
+  group_by(assay_type,stage) %>%
+  mutate(n=sum(n)) %>%
+  ungroup() %>%
+  mutate(assay_type=replace(assay_type,assay_type=="ChIP-seq","ChIP-seq-TF"))
+```
+
+Merge data back together
+```{r}
+data_gp_mg <- data_gp %>%
+  filter(assay_type != "ChIP-seq") %>%
+  full_join(., data_gp_chip_target) %>% 
+  full_join(., data_gp_chip_tf) %>% 
+  arrange(stage)
+```
+
+Merge stages
+```{r}
+data_gp_mg$merged_stage <- ref_stages$merged_stages[match(data_gp_mg$stage, ref_stages$stages)]
+data_gp_mg_sg <- data_gp_mg %>%  group_by(merged_stage,assay_type) %>% distinct(merged_stage,assay_type,assay_group,n) %>%  mutate(n=sum(n)) %>% filter(!is.na(merged_stage))
+
+types <- unique(data_gp_mg_sg$assay_type[order(match(substring(data_gp_mg_sg$assay_type,1,3), substring(ref_types$types,1,3)))])
+types[which(substring(types,1,3)=="ChI")] <- sort(types[which(substring(types,1,3)=="ChI")])
+stages <- unique(data_gp_mg_sg$merged_stage[order(match(data_gp_mg_sg$merged_stage, ref_stages$merged_stages))])
+```
+
+# Figure 1C
+```{r dcc_all_data, fig.height=7, fig.width=10}
+ggplot(data_gp_mg_sg[!duplicated(data_gp_mg_sg[ , c("merged_stage","assay_type","n")]),], aes(x = merged_stage, y = assay_type, size = n, colour = assay_group, alpha=0.85)) +
+  geom_point(stroke=0) +
+  scale_size_continuous(breaks = c(1,50, max(data_gp_mg_sg$n)), range = c(7, 25)) +
+  scale_x_discrete(limits = stages, expand = expansion(mult = c(0.04, 0.04))) +
+  scale_y_discrete(limits = rev(types), expand = expansion(mult = c(0.02, 0.02))) +
+  coord_cartesian(clip = "off") +
+  scale_color_npg() +
+  labs(x = "Stage", y = "Assay type", size = "Number of samples", colour = "Assay group") +
+  theme_bw() +
+  theme(
+    axis.text.x.bottom = element_text(angle = 90, hjust = 1, vjust = 0.5),
+    axis.line = element_line(colour = "black"),
+    panel.border = element_blank(),
+    panel.grid.major.x = element_blank(), 
+    panel.grid.minor.x = element_blank(), 
+    panel.grid.major.y = element_blank(), 
+    panel.grid.minor.y = element_blank()
+  ) +
+  guides(
+    alpha="none",
+     stroke="none",
+     colour = guide_legend(override.aes = list(shape = 15, size=5)),
+     size = guide_legend(override.aes = list(color = "gray"))
+    )
+# ggsave("dcc_all_data.pdf", width = 10, height = 7)
+```
+# Supplimentary Figure 1
+
+Group data by lab
+```{r}
+data_lab <- data %>% group_by(assay_type, assay_group, biosample_lab, assay_target) %>% tally()
+data_lab_hist <- data_lab %>%
+  filter(assay_type == "ChIP-seq" & grepl("^H2|^H3",assay_target)) %>%
+  mutate(assay_type=replace(assay_type,assay_type=="ChIP-seq",paste(assay_type, assay_target,sep="-")))
+data_lab_tf <- data_lab %>%
+  filter(assay_type == "ChIP-seq" & !grepl("^H2|^H3",assay_target)) %>%
+  group_by(assay_type,biosample_lab) %>%
+  mutate(n=sum(n)) %>%
+  ungroup() %>%
+  mutate(assay_type=replace(assay_type,assay_type=="ChIP-seq","ChIP-seq-TF"))
+data_lab[data_lab$assay_type == "ChIP-seq" ,] <- rbind(data_lab_hist,data_lab_tf)
+
+types <- unique(data_lab$assay_type[order(match(substring(data_lab$assay_type,1,3), substring(ref_types$types,1,3)))])
+types[which(substring(types,1,3)=="ChI")] <- sort(types[substring(types,1,3)=="ChI"])
+data_lab$assay_type <- factor(data_lab$assay_type,levels=types)
+data_lab$biosample_lab <- factor(data_lab$biosample_lab,levels=rev(sort(unique(data_lab$biosample_lab))))
+data_lab <- data_lab[!duplicated(data_lab[ , c("biosample_lab","assay_type","n")]),]
+```
+## Lab plot
+```{r , fig.width=10, fig.height=7}
+ggplot(data_lab, 
+       aes(x = assay_type, y = biosample_lab, size = n, colour = assay_group, alpha=0.85)) +
+  geom_point(stroke=0) +
+  scale_size_continuous(breaks = c(1,50, max(data_lab$n)), range = c(7, 25)) +
+  coord_cartesian(clip = "off") +
+  scale_color_npg() +
+  labs(x = "Assay type", y = "Lab", size = "Number of samples", colour = "Assay group") +
+  theme_bw() +
+  theme(
+    axis.text.x.bottom = element_text(angle = 90, hjust = 1, vjust = 0.5),
+    axis.line = element_line(colour = "black"),
+    panel.border = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank()
+  ) +
+  guides(
+    alpha="none",
+     stroke="none",
+     colour = guide_legend(override.aes = list(shape = 15, size=5)),
+     size = guide_legend(override.aes = list(color = "gray"))
+    )
+# ggsave("dcc_lab_data.pdf", width = 10, height = 7)
+```
+
+Group ChIP-seq data by targeted transcription factor.
+```{r}
+data_gp_tf <- data_gp_ip %>% 
+  filter(assay_type == "ChIP-seq") %>% 
+  filter(!grepl("^H2|^H3",assay_target))
+
+# clean up different entries for input/mock
+data_gp_tf[data_gp_tf$assay_target=="Input","assay_target"] <- "input/mock"
+data_gp_tf[data_gp_tf$assay_target=="input","assay_target"] <- "input/mock"
+data_gp_tf[data_gp_tf$assay_target=="Mock","assay_target"] <- "input/mock"
+data_gp_tf[data_gp_tf$assay_target=="mock","assay_target"] <- "input/mock"
+data_gp_tf[data_gp_tf$assay_target=="input_control","assay_target"] <- "input/mock"
+
+data_gp_tf$merged_stage <- ref_stages$merged_stages[match(data_gp_tf$stage, ref_stages$stages)]
+data_gp_tf_sg <- data_gp_tf %>%  group_by(merged_stage,assay_target) %>% distinct(merged_stage,assay_type,n) %>%  mutate(n=sum(n)) %>% filter(!is.na(merged_stage))
+
+data_gp_tf_sg <- data_gp_tf_sg[!duplicated(data_gp_tf_sg[, c("merged_stage","assay_target","n")]),]
+data_gp_tf_sg <- data_gp_tf_sg[order(data_gp_tf_sg$assay_target, decreasing = FALSE),]
+data_gp_tf_sg$assay_target <- factor(data_gp_tf_sg$assay_target,levels=sort(unique(data_gp_tf_sg$assay_target),decreasing = FALSE))
+stages <- unique(data_gp_tf_sg$merged_stage[order(match(data_gp_tf_sg$merged_stage, ref_stages$merged_stages))])
+```
+## TF plot
+```{r}
+ggplot(data_gp_tf_sg, aes(x = merged_stage, y = assay_target, size = n,  alpha=0.85)) +
+  geom_point(stroke=0,colour=pal_npg("nrc")(2)[2]) +
+  scale_size_continuous(breaks = c(1,25, max(data_gp_tf_sg$n)), range = c(7, 25)) +
+  scale_x_discrete(limits = stages, expand = expansion(mult = c(0.04, 0.04))) +
+  coord_cartesian(clip = "off") +
+  labs(x = "Stage", y = "ChIP-seq target", size = "Number of samples") +
+  theme_bw() +
+  theme(
+    axis.text.x.bottom = element_text(angle = 90, hjust = 1, vjust = 0.5),
+    axis.line = element_line(colour = "black"),
+    panel.border = element_blank(),
+    panel.grid.major.x = element_blank(), 
+    panel.grid.minor.x = element_blank(), 
+    panel.grid.major.y = element_blank(), 
+    panel.grid.minor.y = element_blank()
+  ) +
+  guides(
+    alpha="none",
+     stroke="none",
+     colour = "none"
+    )
+
+# ggsave("dcc_tf_data.pdf", width = 10, height = 7)
+```
