@@ -1,0 +1,6 @@
+75-epiboly	H3K27me3	ChIP-seq_Schier_Lab_H3K37me3_0001AS.DCD003123SQ.USERdanio-user.R1.nodup.bam
+75-epiboly	H3K27ac		ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000633SQ.USERpanosfirbas.R1.merged.bam
+75-epiboly	H3K27ac		ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000636SQ.USERpanosfirbas.R1.merged.bam
+75-epiboly	H3K4me1		ChIP-seq_Skarmeta_Lab_H3K4me1_0002AS.DCD000656SQ.USERpanosfirbas.R1.merged.bam
+75-epiboly	H3K4me3		ChIP-seq_Skarmeta_Lab_H3K4me3_0002AS.DCD000643SQ.USERpanosfirbas.R1.merged.bam
+75-epiboly	H3K4me3		ChIP-seq_Skarmeta_Lab_H3K4me3_0002AS.DCD000646SQ.USERpanosfirbas.R1.merged.bam

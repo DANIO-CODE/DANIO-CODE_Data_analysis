@@ -1,0 +1,1256 @@
+---
+title: "Figure 5"
+author: "Damir Baranasic"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Influence of topological organisation in early embryo development
+
+```{r import_libraries, message=FALSE, warning=FALSE, cache=T, echo=F}
+
+library(tidyverse)
+library(rtracklayer)
+library(RColorBrewer)
+library(gridExtra)
+library(readxl)
+library(ggsci)
+library(pbapply)
+library(BSgenome.Drerio.UCSC.danRer10)
+library(SummarizedExperiment)
+library(EnrichedHeatmap)
+library(circlize)
+library(genomation)
+library(heatmaps)
+library(UpSetR)
+library(viridis)
+library(corrplot)
+library(ggsignif)
+library(data.table)
+library(cowplot)
+library(biomaRt)
+library(Gviz)
+library(TxDb.Drerio.UCSC.danRer10.refGene)
+library(kohonen)
+
+TxDb.Drerio.UCSC.danRer10.ensGene <- makeTxDbFromUCSC(genome = "danRer10", 
+                                                      tablename = "ensGene")
+```
+
+```{r functions}
+
+# this will have to go in a separate R file ad source it here
+
+customWinsorize <- function(x, probs = c(0, .99)){
+  vals <- quantile(x, probs = probs)
+  tmp <- x
+  tmp[x < vals[1]] <- vals[1]
+  tmp[x > vals[2]] <- vals[2]
+  tmp
+}
+
+customDistanceToFeature <- function(query, features){
+  
+  absDistances <- distanceToNearest(query, features)
+  
+  outRanges <- query[queryHits(absDistances)]
+  outRanges$queryIdx <- queryHits(absDistances)
+  outRanges$featureIdx <- subjectHits(absDistances)
+  outRanges$distance <- elementMetadata(absDistances)$distance
+  
+  sign <- vector(length = length(outRanges))
+  pr <- precede(outRanges, features)
+  fl <- follow(outRanges, features)
+  sign[pr == subjectHits(absDistances)] <- -1
+  sign[fl == subjectHits(absDistances)] <- 1
+
+  outRanges$sign <- sign
+  outRanges
+  
+}
+
+tads_48hpf <- import("data/Zebrafish_48hpf_TADs.GRCz10.bed")
+seqlevelsStyle(tads_48hpf) <- "UCSC"
+grb <- import("data/danRer10_AstMex102_binned_kurtosis_arl_370_0.7_pc_18_kb_windows_grbs.bed")
+domeEnsamble <- import("~/utils/master/dome_all_v3/dome_Gateway_SuperEnhancers.bed")
+
+tads_48hpf$ensembles <- tads_48hpf %over% domeEnsamble
+tads_48hpf$ensembles <- ifelse(tads_48hpf$ensembles, "Ensemble", "without")
+tads_48hpf$grb <- tads_48hpf %over% grb
+tads_48hpf$grb <- ifelse(tads_48hpf$grb, "grb", "non_grb")
+tads_ord <- tads_48hpf[order(width(tads_48hpf), decreasing = T)]
+
+grb_tads <- tads_48hpf[tads_48hpf$grb == "grb"]
+
+promoters <- import("data/DANIO-CODE_promoters_consens.canonical.Piotr_v1.bed")
+promoters_strand <- split(promoters, strand(promoters))
+pdreFCSE <- readRDS('pdreFCSE.RDS')
+pdreGR <- SummarizedExperiment::rowRanges(pdreFCSE)
+pdre_som <- readRDS("/mnt/storage/Damir/pdre_distal_som_04012021.RDS")
+nonPromoterPdre <- which(!(pdreGR %over%
+                                    resize(promoters,
+                                           width = 1000, fix = "center")))
+distalPdre <- pdreGR[nonPromoterPdre]
+
+pathToSegmentFiles <- "export_tracks"
+segmentFiles <- c(Dome = "dome_ATAC_stageSpecific_ChromHMM_annotation.bed",
+                  Epi75 = "Epi75_ATAC_stageSpecific_ChromHMM_annotation.bed",
+                  Hpf12 = "Hpf12_ATAC_stageSpecific_ChromHMM_annotation.bed",
+                  Prim5 = "prim5_ATAC_stageSpecific_ChromHMM_annotation.bed",
+                  LongPec = "longPec_ATAC_stageSpecific_ChromHMM_annotation.bed")
+segmentFiles <- str_c(pathToSegmentFiles, segmentFiles, sep = "/")
+
+segments <- lapply(segmentFiles, rtracklayer::import)
+names(segments) <- c("Dome", "Epi75", "Hpf12", "Prim5", "LongPec")
+padre_assignment <- lapply(segments, function(x) x$name)
+names(padre_assignment) <- names(modelMatrices)
+segments <- mapply(function(x, y) {
+  tmp <- x$peaks
+  tmp$name <- y
+  tmp
+}, modelMatrices, padre_assignment)
+
+path <- "/mnt/storage/Damir/ChromHMM"
+stages <- c("Dome", "75-epiboly", "5-9somites", "Prim-5", "High-Pec")
+analyzedStages <- c("Dome", "75-epiboly", "5-9somites", "Prim-5", "Long-Pec")
+folder <- c(rep("ChromHMM_out_v4_reordered", each = 4), 
+          "ChromHMM_out_v4.2_reordered")
+filePattern <- "dense.bed"
+
+segmentationFiles <- list.files(str_c(path, stages, folder, sep = "/"), 
+                           pattern = filePattern, full.names = T)
+segmentationFiles <- segmentationFiles[c(3, 2, 1, 5, 4)]
+names(segmentationFiles) <- c("Dome", "Epi75", "Hpf12", "Prim5", "LongPec")
+genomeSegments <- lapply(segmentationFiles, import)
+
+poised <- rep(list(c("8_TssBiv", "9_ReprPC")), times = 5)
+poised[[5]] <- c(poised[[5]], "2_TssA2", "4_TssFlank2")
+
+poisedPromotersIdx <- mapply(function(x, y){
+ promoters %over% x[x$name %in% y]
+}, genomeSegments, poised) %>% apply(1, any) %>% which()
+
+promoters$polycomb <- "not"
+promoters$polycomb[poisedPromotersIdx] <- "polycomb"
+names(promoters) <- promoters$name
+
+distToPromoters <- customDistanceToFeature(distalPdre, promoters)
+
+distToPromoters$polycomb <- promoters$polycomb[distToPromoters$featureIdx]
+distToPromoters$SOM_class <- pdre_som$som$unit.classif[distToPromoters$queryIdx]
+
+distToTSSSOM <- as.data.frame(distToPromoters)
+
+segmentsWithTSSDistances <- lapply(names(segments), function(x){
+  
+  ranges <- customDistanceToFeature(segments[[x]], promoters)
+  ranges$promoter <- ifelse(ranges %over% promoters, 
+                            "promoter", "distal")
+  ranges$stage <- x
+  ranges$polycomb <- promoters$polycomb[ranges$featureIdx]
+  ranges
+})
+
+phastCons_fish <- readRDS("~/phastCons_cyprinides.RDS")
+
+somTC <- read_rds("/mnt/piotrcluster/DanioCodeCage/promoterClassification2020/consClusKm.take.som.s7.RDS")
+
+# promDominant_with_krL.RDS
+kMeansTC <- read_rds("/mnt/piotrcluster/DanioCodeCage/promoterClassification2020/promDominant_with_krL.RDS")
+
+# This is a list of tibbles. Each tibble has a column "promI" which is promoter index from "promDominant"
+# The order is as in fig3 (but please always keep list names, to make sure)
+
+noIdea <- read_rds("/mnt/piotrcluster/DanioCodeCage/promoterClassification2020/promIbyClassAndExpression.RDS")
+
+```
+
+```{r make_score_matrices, eval=F}
+# This is the code which produces score matrices for panel B and panel I
+# the matrices are stored in an .RData object, no need to run the code for
+# time and memory sake
+
+k27ac <- c(dome = "dome.bw",
+           Epi75 = "Epi75.bw",
+           Som8 = "Som8.bw",
+           prim5 = "Prim5.bw",
+           longPec = "LongPec.bw")
+
+k27me3 <- c(dome = "ChIP-seq_Skarmeta_Lab_H3K27me3_0002AS.DCD000631SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bw",
+           Epi75 = "ChIP-seq_Schier_Lab_H3K37me3_0001AS.DCD003123SQ.USERdanio-user.R1.merged.bw",
+           Som8 = "Som-K27me3_S10_L001_R1_001.merged.nodup.bw",
+           prim5 = "ChIP-seq_Skarmeta_Lab_H3K27me3_0002AS.DCD000632SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bw",
+           longPec = "ChIP-seq_Skarmeta_Lab_H3K27me3_0002AS.DCD000630SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bw")
+
+ATACurl <-
+  c(
+    dome = "http://data.genereg.net/damir/ATAC_signal_pooled/ATAC-seq_Skarmeta_Lab_0002AS.DCD003082SQ.USERmickael.dong.R1.merged.filt.tn5.pooled.rpm.signal.bigwig",
+    Shield = "http://data.genereg.net/damir/ATAC_signal_pooled/ATAC-seq_Skarmeta_Lab_0002AS.DCD003090SQ.USERmickael.dong.R1.merged.filt.tn5.pooled.rpm.signal.bigwig",
+    Epi75 = "http://data.genereg.net/damir/ATAC_signal_pooled/ATAC-seq_Skarmeta_Lab_0002AS.DCD003089SQ.USERmickael.dong.R1.merged.filt.tn5.pooled.rpm.signal.bigwig",
+    Som8 = "http://data.genereg.net/damir/ATAC_signal_pooled/ATAC-seq_Skarmeta_Lab_0002AS.DCD003096SQ.USERmickael.dong.R1.merged.filt.tn5.pooled.rpm.signal.bigwig",
+    prim5 = "http://data.genereg.net/damir/ATAC_signal_pooled/ATAC-seq_Skarmeta_Lab_0001AS.DCD000395SQ.USERpanosfirbas.R1.merged.filt.tn5.pooled.rpm.signal.bigwig",
+    longPec = "http://data.genereg.net/damir/ATAC_signal_pooled/ATAC-seq_Skarmeta_Lab_0002AS.DCD003088SQ.USERmickael.dong.R1.merged.filt.tn5.pooled.rpm.signal.bigwig"
+  )
+
+preMZT_ATAC <- list.files(
+  "/mnt/storage/Damir/ATAC-seq_resuts/ATAC_pileups_RPM_macs/", 
+  pattern = "pooled_rpm.bigwig", full.names = T)
+preMZT_ATAC <- preMZT_ATAC[c(3, 4, 1, 2)]
+names(preMZT_ATAC) <- c("c32", "c64", "c128", "c256")
+ATACurl <- c(preMZT_ATAC, ATACurl)
+
+k27acUrl <- paste0("http://trackhub.genereg.net/DANIO-CODE/danRer10/", k27ac)
+k27acUrl <- c(c256 = "http://data.genereg.net/damir/K27ac_256cell.bigwig",
+              k27acUrl)
+
+preMZT_K27me3 <- list.files("/mnt/storage/Damir/preMZT_K27me3/", pattern = "bigwig", full.names = T)
+preMZT_K27me3 <- preMZT_K27me3[c(2, 3, 1)]
+names(preMZT_K27me3) <- c("c16", "c64", "c128")
+
+k27me3Url <- paste0("http://trackhub.genereg.net/DANIO-CODE/danRer10/", k27me3)
+k27me3Url <- c(preMZT_K27me3, k27me3Url)
+
+k27acCov <- lapply(k27acUrl, import)
+ATACCov <- lapply(ATACurl, import)
+k27me3Cov <- lapply(k27me3Url, import)
+
+
+names(k27acCov) <- c("c256", "dome", "epi75", "som8", "prim5", "longPec")
+names(ATACCov) <- c("c32", "c64", "c128", "c256", 
+                    "dome", "shield", "epi75", "som8", "prim5", "longPec")
+names(k27me3Cov) <- c("dome", "epi75", "som8", "prim5", "longPec")
+
+stages <- c("c16", "c32", "c64", "c128", "c256", "dome", "shield",
+            "epi75", "som8", "prim5", "longPec")
+
+tads_ord <- tads_48hpf[order(width(tads_48hpf), decreasing = T)]
+
+smATAC_meta <-  ScoreMatrixList(ATACCov, 
+                 resize(tads_ord, width = width(tads_ord) * 3, fix = "center"),
+                 bin.num = 1200,
+                weight.col = "score")
+
+smK27ac_meta <-  ScoreMatrixList(k27acCov, 
+                 resize(tads_ord, width =  width(tads_ord) * 3, fix = "center"),
+                 bin.num = 1200,
+                weight.col = "score")
+
+smK27me3_meta <-  ScoreMatrixList(k27me3Cov, 
+                 resize(tads_ord, width =  width(tads_ord) * 3, fix = "center"),
+                 bin.num = 1200,
+                weight.col = "score")
+
+smATAC_fun <-  ScoreMatrixList(ATACCov, 
+                 resize(tads_ord, width = max(width(tads_ord)), fix = "center"),
+                 bin.num = 1200,
+                weight.col = "score")
+
+smK27ac_fun <-  ScoreMatrixList(k27acCov, 
+                 resize(tads_ord, width = max(width(tads_ord)), fix = "center"),
+                 bin.num = 1200,
+                weight.col = "score")
+
+smK27me3_fun <-  ScoreMatrixList(k27me3Cov, 
+                 resize(tads_ord, width = max(width(tads_ord)), fix = "center"),
+                 bin.num = 1200,
+                weight.col = "score")
+
+fun_SM <- list(ATAC = smATAC_fun,
+               H3K27ac = smK27ac_fun,
+               H3K27me3 = smK27me3_fun)
+
+meta_SM <- list(ATAC = smATAC_meta,
+               H3K27ac = smK27ac_meta,
+               H3K27me3 = smK27me3_meta)
+
+```
+
+## B
+
+Profiles of chromatin opening through development within GRB (left) and non-GRB
+(right) TADs respectively. For easier comparison, signals for each stage are scaled from 0 to 1.
+
+```{r panelB}
+
+grb_idx <- which(tads_ord$grb[as.numeric(rownames(smATAC_meta[[1]]))] == "grb")
+non_grb_idx <- which(tads_ord$grb[
+  as.numeric(rownames(smATAC_meta[[1]]))] == "non_grb")
+
+# subsample non-grb for comparison
+set.seed(12345)
+non_grb_idx_sub <- non_grb_idx[sample(1:length(non_grb_idx),
+                                      length(grb_idx),
+                                      replace = F)]
+
+grbATAC_sml <- lapply(smATAC_meta, function(x) x[grb_idx, ])
+grbATAC_sml <- as(grbATAC_sml, Class = "ScoreMatrixList")
+
+non_grbATAC_sml <- lapply(smATAC_meta, function(x) x[non_grb_idx_sub, ])
+non_grbATAC_sml <- as(non_grbATAC_sml, Class = "ScoreMatrixList")
+
+# take only postZGA samples
+
+grbATAC_sml_zga <- grbATAC_sml[5:10]
+non_grbATAC_sml_zga <- non_grbATAC_sml[5:10]
+
+grb_ATAC_df <- lapply(names(grbATAC_sml_zga), function(x) {
+  grbATAC_sml_zga[[x]]@.Data %>% customWinsorize(probs = c(0, .95)) %>%
+    as.data.frame() %>% rownames_to_column(var = "tad_num") %>%
+    mutate(stage = x,
+           grb = tads_ord$grb[as.numeric(tad_num)]) %>%
+    relocate(stage, grb) %T>% 
+    { colnames(.)[4:ncol(.)] <- 1:(ncol(.) - 3) } %>%
+    pivot_longer(-c(grb, stage, tad_num), 
+                 names_to = "position", values_to = "score") %>%
+    mutate(position = as.numeric(position)) %>%
+    group_by(stage, grb, position) %>% 
+    summarize(score = mean(score)) %>% 
+    mutate(score = (score - min(score)) / (max(score) - min(score))) %>%
+    ungroup()
+}) %>% { do.call(rbind, .) } %>% 
+  mutate(stage = factor(stage, levels = names(grbATAC_sml_zga))) 
+
+non_grb_ATAC_df <- lapply(names(non_grbATAC_sml_zga), function(x) {
+  non_grbATAC_sml_zga[[x]]@.Data %>% customWinsorize(probs = c(0, .95)) %>%
+    as.data.frame() %>% rownames_to_column(var = "tad_num") %>%
+    mutate(stage = x,
+           grb = tads_ord$grb[as.numeric(tad_num)]) %>%
+    relocate(stage, grb) %T>% 
+    { colnames(.)[4:ncol(.)] <- 1:(ncol(.) - 3) } %>%
+    pivot_longer(-c(grb, stage, tad_num), 
+                 names_to = "position", values_to = "score") %>%
+    mutate(position = as.numeric(position)) %>%
+    group_by(stage, grb, position) %>% 
+    summarize(score = mean(score)) %>% 
+    mutate(score = (score - min(score)) / (max(score) - min(score))) %>%
+    ungroup()
+}) %>% { do.call(rbind, .) } %>% 
+  mutate(stage = factor(stage, levels = names(non_grbATAC_sml_zga)))
+
+panelB <- grb_ATAC_df %>% rbind(non_grb_ATAC_df) %>% 
+  ggplot(aes(position, score, colour = stage)) + 
+  geom_smooth(method = "loess", span = .075, se = F, size = 1) + 
+  geom_vline(xintercept = c(400, 800), 
+             colour = "#999999", linetype = "dashed") +  theme_bw() + 
+  facet_grid(~ grb) +
+  scale_color_brewer(palette = "Reds", direction = 1) +
+  scale_x_continuous(breaks = c(400, 800), labels = c("start", "end")) +
+  theme(legend.position = "bottom", legend.margin = margin(c(0, 0, 0, 0))) + 
+  guides(colour = guide_legend(nrow = 1))
+
+```
+
+## B - supplement
+
+```{r}
+
+
+```
+
+
+## C
+
+```{r panel_c}
+
+grbSegments <- lapply(segments, subsetByOverlaps, grb_tads)
+
+grbSegmentsWithTSSDistances <- lapply(names(segments), function(x){
+  
+  ranges <- customDistanceToFeature(segments[[x]], promoters)
+  ranges$promoter <- ifelse(ranges %over% promoters, 
+                            "promoter", "distal")
+  ranges$stage <- x
+  ranges$polycomb <- promoters$polycomb[ranges$featureIdx]
+  ranges
+})
+
+
+grbSegmentsDistToTSSDF <- grbSegmentsWithTSSDistances %>% 
+  lapply(as.data.frame) %>% 
+  { do.call(rbind, .) }
+
+median_plot <- grbSegmentsDistToTSSDF %>% drop_na() %>%
+    filter(promoter == "distal" & name %in%
+               c("5_EnhA1", "6_EnhFlank",
+                 "7_EnhWk1")) %>%
+    mutate(stage = factor(stage,
+                          levels =
+                              c("Dome", "Epi75", "Hpf12",
+                                "Prim5", "LongPec"))) %>%
+  # arrange(desc(pVals)) %>% group_by(stage) %>%
+  # slice(1:2000) %>%
+    ggplot(aes(stage, distance, group = 1)) + 
+    stat_summary(fun.data = 
+                   function(x) data.frame(y = median(x)), 
+                 geom = "line") +
+    stat_summary(fun.data = 
+                   function(x) data.frame(y = median(x), 
+                                          ymin = quantile(x, .25),
+                                          ymax = quantile(x, .75)), 
+                 size = 0.75) + coord_cartesian(ylim = c(10000, 60000)) +
+    theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+cum_dist_plot <- grbSegmentsDistToTSSDF %>% drop_na() %>%
+  filter(promoter == "distal" & name %in%
+           c("5_EnhA1", "6_EnhFlank",
+             "7_EnhWk1")) %>%
+  group_by(stage) %>%
+  # arrange(desc(pVals)) %>% group_by(stage) %>%
+  # slice(1:2000) %>%
+  summarise(tibble(values = seq(2.7, 6, .1),
+                   percentiles = ecdf(log10(distance))(seq(2.7, 6, .1)))) %>%
+  ungroup() %>%
+  mutate(stage = factor(stage,
+                        levels =
+                          c("Dome", "Epi75", "Hpf12",
+                            "Prim5", "LongPec"))) %>%
+  ggplot(aes(values, percentiles)) + geom_line(aes(color = stage)) +
+  theme_bw() + theme(legend.position = c(0.1, 0.6)) + 
+  scale_color_brewer(palette = "Reds", direction = 1) +
+  annotation_custom(ggplotGrob(median_plot), 
+                    xmin = 5, xmax = 6, ymin = 0, ymax = 0.75) +
+  labs(x = "log10(distance)")
+
+enhancersSegmentsReduced <- list()
+
+enhancersSegmentsReduced$early <- IRanges::reduce(
+  grbSegments$Dome[grbSegments$Dome$name %in% 
+                        c("5_EnhA1", "6_EnhA2", "7_EnhWk1")])
+enhancersSegmentsReduced$late <- IRanges::reduce(
+  grbSegments$Prim5[grbSegments$Prim5$name %in% 
+                         c("5_EnhA1", "6_EnhA2", "7_EnhWk1")])
+
+enhancersSegmentsReducedDF <- enhancersSegmentsReduced %>% names() %>%
+  lapply(function(x){
+    tmp <- as.data.frame(enhancersSegmentsReduced[[x]])
+    tmp$time <- x
+    tmp
+  }) %>% { do.call(rbind, .) }
+
+segNum <- enhancersSegmentsReducedDF %>% ggplot(aes(time)) + 
+  geom_bar() + coord_flip() + theme_bw()
+
+give.n <- function(x){
+  return(c(y = 3.51, label = length(x))) 
+  # experiment with the multiplier to find the perfect position
+}
+
+enhancersSegmentsReducedDF %>% { wilcox.test(width ~ time, data = .) }
+enhancersSegmentsReducedDF %>% { t.test(width ~ time, data = .) }
+enhancersSegmentsReducedDF %>% filter(width > 400) %>% 
+  { t.test(width ~ time, data = .) }
+enhancersSegmentsReducedDF %>% filter(width > 400) %>% 
+  { wilcox.test(width ~ time, data = .) }
+
+
+segWidth <- enhancersSegmentsReducedDF %>% filter(width > 400) %>%
+  ggplot(aes(time, log10(width))) + geom_violin(bw = .03) + 
+  geom_boxplot(width = .25) +
+  stat_summary(fun.data = give.n, geom = "text") +
+  theme_bw()
+
+
+panelC <- plot_grid(cum_dist_plot, segWidth, nrow = 1, rel_widths = c(2, 1))
+# bottom_row <- plot_grid(segNum, segWidth)
+#plot_grid(cum_dist_plot, bottom_row, nrow = 2)
+
+ggsave2("Figure_5BC_v2.pdf", plot_grid(panelB, panelC, nrow = 2),
+        width = 10, height = 7, units = "in", dpi = 300)
+
+```
+
+## C - supplement
+
+```{r seg_funnels}
+
+grb_tads$name <- str_c("GRB", 1:length(grb_tads))
+
+# reduced segments
+
+all_stages_enh_seg_reduced_funnels <- lapply(genomeSegments, function(x){
+enh_seg_in_tads <- findOverlapPairs(
+  IRanges::reduce(x[x$name %in% 
+                        c("5_EnhA1", "6_EnhA2", "7_EnhWk1")]),
+  resize(grb_tads, width = max(width(grb_tads)), fix = "center"))
+
+seg_tmp <- as.data.frame(enh_seg_in_tads@first)
+colnames(seg_tmp) <- str_c("seg_", colnames(seg_tmp))
+tad_tmp <- as.data.frame(enh_seg_in_tads@second)
+colnames(tad_tmp) <- str_c("tad_", colnames(tad_tmp))
+
+enh_seg_in_grb_df <- cbind(seg_tmp, tad_tmp)
+
+enh_seg_in_grb_df %>% mutate(tad_center = 
+                                               tad_start + (tad_width / 2),
+                             seg_start = ifelse(seg_start < tad_start, 
+                                                tad_start, seg_start),
+                             seg_end = ifelse(seg_end > tad_end, 
+                                              tad_end, seg_end),
+                             rel_start = seg_start - tad_center,
+                             rel_end = seg_end - tad_center, 
+                             tad_name = factor(tad_name, 
+                                               levels = grb_tads$name[
+                                                 order(width(grb_tads))])) %>%
+  ggplot(aes(color = log10(seg_width))) + 
+  geom_segment(aes(x = tad_name, xend = tad_name, 
+                   y = rel_start, yend = rel_end)) + 
+  theme_classic() + theme(axis.text.y = element_blank(), 
+                          axis.title.y = element_blank(), 
+                          axis.ticks.y = element_blank()) + 
+  coord_flip() + 
+  scale_color_viridis(option = "A", direction = -1, limits = c(2.3, 5.32)) 
+})
+
+legend <- get_legend(
+  # create some space to the left of the legend
+  all_stages_enh_seg_reduced_funnels$Dome + 
+    theme(legend.box.margin = margin(0, 0, 0, 12))
+)
+
+funnels_grid <- plot_grid(all_stages_enh_seg_reduced_funnels$Dome + 
+                            theme(legend.position="none"), 
+                          all_stages_enh_seg_reduced_funnels$Epi75 + 
+                            theme(legend.position="none"), 
+                          #all_stages_enh_seg_reduced_funnels$Hpf12 + 
+                          #  theme(legend.position="none"), 
+                          all_stages_enh_seg_reduced_funnels$Prim5 + 
+                            theme(legend.position="none"), 
+                          all_stages_enh_seg_reduced_funnels$LongPec + 
+                            theme(legend.position="none"), 
+                          nrow = 1, align = "hv",
+                          labels = c("Dome", "75% epiboly",
+                                     "Prim-5", "Long-pec"))
+
+plot_grid(funnels_grid, legend, rel_widths = c(1, .1))
+
+```
+
+grb_ensembles[order(countOverlaps(grb_ensembles, promoters), decreasing = T)][11:15]
+## D
+
+```{r browser_screenshot}
+
+mycnLocus <- GRanges("chr3:40162043-40527584")
+
+gTrack <- GenomeAxisTrack()
+genMod <- GeneRegionTrack(TxDb.Drerio.UCSC.danRer10.ensGene, 
+                          chromosome = "chr3", start = start(mycnLocus), 
+                          end = end(mycnLocus), name = "",
+                          collapseTranscripts = "longest", 
+                          transcriptAnnotation = "symbol",
+                          fill = "firebrick", 
+                          col = "firebrick")
+
+domeLink <- "http://trackhub.genereg.net/DANIO-CODE/danRer10/dome.bw"
+domeTrack <-  DataTrack(range = domeLink,
+                      importFunction = function(file) rtracklayer::import(con=file,
+                                                            which = mycnLocus),
+                      background.title = "brown", fontcolor	= "black", 
+                      name = "Dome", fill = "navy", 
+                      col.histogram = "navy", type = "hist", ylim = c(0, 4),
+                      window = -1, windowSize = 1000)
+
+prim5Link <- "http://trackhub.genereg.net/DANIO-CODE/danRer10/Prim5.bw"
+prim5Track <-  DataTrack(range = prim5Link,
+                      importFunction = function(file) rtracklayer::import(con=file,
+                                                            which = mycnLocus),
+                      background.title = "brown", fontcolor	= "black", 
+                      name = "Prim-5", fill = "tomato", 
+                      col.histogram = "tomato", type = "hist", ylim = c(0, 4),
+                      window = -1, windowSize = 1000)
+
+ensemblesSub <- subsetByOverlaps(domeEnsamble, mycnLocus)
+ensembleTrack <- AnnotationTrack(ensemblesSub, fill = "black")
+
+promSub <- subsetByOverlaps(promoters, mycnLocus)
+promTrack <- AnnotationTrack(promSub, fill = "black")
+
+padreSub <- subsetByOverlaps(distalPdre, mycnLocus)
+bothPadre <- padreSub[(padreSub %over% segments$Prim5) &
+                        (padreSub %over% segments$Dome)]
+bothPadre$type <- "both"
+earlyPadre <- padreSub[!(padreSub %over% segments$Prim5) &
+                        (padreSub %over% segments$Dome)]
+earlyPadre$type <- "early"
+latePadre <- padreSub[(padreSub %over% segments$Prim5) &
+                        !(padreSub %over% segments$Dome)]
+latePadre$type <- "late"
+
+padreSubAlt <- c(bothPadre, earlyPadre, latePadre)
+padreSubAltTrack <- AnnotationTrack(padreSubAlt)
+feature(padreSubAltTrack) <- padreSubAlt$type
+
+
+
+bothTrack <- AnnotationTrack(bothPadre)
+earlyTrack <- AnnotationTrack(earlyPadre)
+lateTrack <- AnnotationTrack(latePadre)
+
+
+
+# plotTracks(
+#   list(gTrack, genMod, domeTrack, prim5Track, ensembleTrack, promSub), scale = 0.25, 
+#   fontcolor.title = 1, 
+#   col.axis = 1, background.title = "white",
+#   transcriptAnnotation = "symbol", 
+#   fontcolor.feature = 1, just.feature = "above",
+#   fill = NULL, col =)
+
+sall1aScreenshot <- grid.grabExpr(plotTracks(
+  list(gTrack, genMod, domeTrack, prim5Track, ensembleTrack, promTrack, 
+       padreSubAltTrack), 
+  scale = 0.25, 
+  fontcolor.title = 1, sizes = c(.05, .05, .25, .25, .1, .15, .15),
+  both = "purple", early = "blue", late = "red",
+  col.axis = 1, background.title = "white",
+  transcriptAnnotation = NULL, 
+  fontcolor.feature = 1, just.feature = "above"))
+
+```
+
+```{r ensemble_zoomin}
+
+zoomInEnsamble <- GRanges("chr3:40377700-40462993")
+
+gTrack <- GenomeAxisTrack()
+# genMod <- GeneRegionTrack(TxDb.Drerio.UCSC.danRer10.ensGene, 
+#                           chromosome = "chr3", start = start(mycnLocus), 
+#                           end = end(mycnLocus), name = "",
+#                           collapseTranscripts = "longest", 
+#                           transcriptAnnotation = "symbol",
+#                           fill = "firebrick", 
+#                           col = "firebrick")
+
+#domeLink <- "http://trackhub.genereg.net/DANIO-CODE/danRer10/dome.bw"
+domeTrackZoom <-  DataTrack(range = domeLink,
+                      importFunction = function(file) rtracklayer::import(con=file,
+                                                            which = zoomInEnsamble),
+                      background.title = "brown", fontcolor	= "black", 
+                      name = "Dome", fill = "navy", 
+                      col.histogram = "navy", type = "hist", ylim = c(0, 4),
+                      window = -1, windowSize = 500)
+
+#prim5Link <- "http://trackhub.genereg.net/DANIO-CODE/danRer10/Prim5.bw"
+prim5TrackZoom <-  DataTrack(range = prim5Link,
+                      importFunction = function(file) rtracklayer::import(con=file,
+                                                            which = zoomInEnsamble),
+                      background.title = "brown", fontcolor	= "black", 
+                      name = "Prim-5", fill = "tomato", 
+                      col.histogram = "tomato", type = "hist", ylim = c(0, 4),
+                      window = -1, windowSize = 500)
+
+ensemblesSubZoom <- subsetByOverlaps(domeEnsamble, zoomInEnsamble)
+ensembleTrackZoom <- AnnotationTrack(ensemblesSubZoom, fill = "black")
+
+promSubZoom <- subsetByOverlaps(promoters, zoomInEnsamble)
+promTrackZoom <- AnnotationTrack(promSubZoom, fill = "black")
+
+padreSubZoom <- subsetByOverlaps(distalPdre, zoomInEnsamble)
+bothPadreZoom <- padreSubZoom[(padreSubZoom %over% segments$Prim5) &
+                        (padreSubZoom %over% segments$Dome)]
+bothPadreZoom$type <- "both"
+# earlyPadreZoom <- padreSubZoom[!(padreSubZoom %over% segments$Prim5) &
+#                         (padreSubZoom %over% segments$Dome)]
+# earlyPadreZoom$type <- "early"
+latePadreZoom <- padreSubZoom[(padreSubZoom %over% segments$Prim5) &
+                        !(padreSubZoom %over% segments$Dome)]
+latePadreZoom$type <- "late"
+
+padreSubAltZoom <- c(bothPadreZoom, latePadreZoom)
+padreSubAltTrackZoom <- AnnotationTrack(padreSubAltZoom)
+feature(padreSubAltTrackZoom) <- padreSubAltZoom$type
+
+
+
+# bothTrack <- AnnotationTrack(bothPadre)
+# earlyTrack <- AnnotationTrack(earlyPadre)
+# lateTrack <- AnnotationTrack(latePadre)
+
+
+
+# plotTracks(
+#   list(gTrack, genMod, domeTrack, prim5Track, ensembleTrack, promSub), scale = 0.25, 
+#   fontcolor.title = 1, 
+#   col.axis = 1, background.title = "white",
+#   transcriptAnnotation = "symbol", 
+#   fontcolor.feature = 1, just.feature = "above",
+#   fill = NULL, col =)
+
+sall1aScreenshotZoom <- grid.grabExpr(plotTracks(
+  list(gTrack, domeTrackZoom, prim5TrackZoom, ensembleTrackZoom, promTrackZoom, 
+       padreSubAltTrackZoom), 
+  scale = 0.25, 
+  fontcolor.title = 1, sizes = c(.05, .3, .3, .1, .1, .15),
+  both = "purple",  late = "red",
+  col.axis = 1, background.title = "white",
+  transcriptAnnotation = NULL, 
+  fontcolor.feature = 1, just.feature = "above"))
+
+```
+
+```{r panelD}
+
+plot_df <- tads_48hpf %>% as.data.frame() %>% group_by(grb, ensembles) %>% 
+  summarize(count = n()) %>% ungroup() %>% 
+  group_by(grb) %>% mutate(percentage = count / sum(count))
+
+proportionOfTADSwithEnsembles <-  plot_df %>%
+  ggplot(aes(grb, percentage, fill = ensembles)) + geom_col() + 
+  theme_classic() + scale_fill_manual(values = c("#ca0020", "#0571b0")) +
+  geom_signif(comparisons = list(c("grb", "non_grb")), 
+              annotations = "***", y_position = 1.05,
+              tip_length = .01, vjust=0.4) +
+  theme(legend.position = "bottom")
+
+ensemble_tads_split <- tads_48hpf %>% as.data.frame() %>% 
+  filter(ensembles == "Ensemble") %>% 
+  makeGRangesFromDataFrame(keep.extra.columns = T) %>% { split(., .$grb) } %>% 
+  lapply(function(x) { 
+    list(within_ensemble = intersect(x, domeEnsamble), 
+         outside_ensamble = setdiff(x, domeEnsamble))}) %>% unlist()
+
+prom_number <- lapply(ensemble_tads_split, function(x) {
+  countOverlaps(x, promoters)
+})
+
+total_width <- sapply(ensemble_tads_split, function(x) sum(width(x)))
+total_proms <- sapply(prom_number, sum)
+
+ total_proms / (total_width / 100000)
+ 
+ prom_number_df <- lapply(names(ensemble_tads_split), function(id) {
+   x <- ensemble_tads_split[[id]]
+   pn <- countOverlaps(x, promoters)
+   wdt <- width(x)
+   data.frame(
+     class = id,
+     promoter_numer = pn,
+     width = wdt,
+     per_100kb = pn / 
+       (wdt / 100000)
+   )
+ }) %>% { do.call(rbind, .) } %>% separate(class, 
+                                           into = c("grb", "ensemble"), 
+                                           sep = "\\.")
+ 
+ prom_number_plot <- prom_number_df %>% 
+   ggplot(aes(grb, log(per_100kb + 1), colour = ensemble)) +
+   geom_violin(draw_quantiles = .5) +
+   ggtitle("Total number of promoters in TADs with ensembles") +
+   scale_color_manual(values = c("#ca0020", "#0571b0"))  + theme_bw() + 
+   theme(legend.position = "bottom", legend.margin = margin(c(0, 0, 0, 0))) +
+   coord_flip()
+ 
+ 
+ padre_ensemble <- lapply(names(ensemble_tads_split), function(id) {
+  
+  pn <- subsetByOverlaps(distalPdre, ensemble_tads_split[[id]])
+  pn$name <- id
+  pn
+  
+}) %>% { do.call(c, .) } %>% as.data.frame() %>% 
+  separate(name, 
+           into = c("grb", "ensemble"), 
+           sep = "\\.") %>% makeGRangesFromDataFrame(keep.extra.columns = T) %>%
+  binnedAverage(phastCons_fish, varname = "phastCons_fish")
+
+padre_ensemble$time <- "none"
+padre_ensemble$time[(padre_ensemble %over% modelMatrices$prim5$peaks)] <- "late"
+padre_ensemble$time[(padre_ensemble %over% modelMatrices$dome$peaks)] <- "early"
+padre_ensemble$time[
+  (padre_ensemble %over% modelMatrices$dome$peaks) & 
+    (padre_ensemble %over% modelMatrices$prim5$peaks)] <- "both"
+
+padre_ensemble_time <- split(padre_ensemble, padre_ensemble$time)
+
+padre_number_df <- lapply(names(padre_ensemble_time), function(i){
+  lapply(names(ensemble_tads_split), function(id) {
+   x <- ensemble_tads_split[[id]]
+   pn <- countOverlaps(x, padre_ensemble_time[[i]])
+   wdt <- width(x)
+   data.frame(
+     class = id,
+     padre_numer = pn,
+     width = wdt,
+     per_100kb = pn / 
+       (wdt / 100000),
+     time = i
+   )
+ }) %>% { do.call(rbind, .) } %>% separate(class, 
+                                           into = c("grb", "ensemble"), 
+                                           sep = "\\.") 
+ }) %>% { do.call(rbind, .) }
+
+padre_number_plot <- padre_number_df %>% filter(time != "none") %>%
+   ggplot(aes(time, log(per_100kb + 1), colour = ensemble)) +
+   geom_violin(draw_quantiles = .5,  size = 1, width = .65) +
+  facet_grid(~ grb) +
+   ggtitle("Total number of PADREs in TADs with ensembles") +
+  theme_bw() + scale_colour_manual(values = c("#ca0020", "#0571b0"))
+
+phastCons_PADRE_ensambles <- padre_ensemble %>% as.data.frame() %>% 
+  filter(time != "none") %>% 
+  ggplot(aes(time, phastCons_fish, colour = ensemble)) + 
+  geom_violin(size = 1, position = position_dodge(width = .4), width = .45) +
+    stat_summary(fun.data = quartile_width, position = position_dodge(width = .4)) +
+  facet_wrap(~ grb) + 
+  ggtitle("Conservation of distal regulatory elements in ensamble containing TADs in respect to activity time") + 
+  theme_bw() + scale_colour_manual(values = c("#ca0020", "#0571b0"))
+
+top_row <- plot_grid(proportionOfTADSwithEnsembles, 
+                       prom_number_plot + theme(legend.position = "none"), 
+                     rel_widths = c(1, 2))
+
+bottom_rows <- plot_grid(padre_number_plot + theme(legend.position = "none" ,
+                                                   axis.text.x = element_blank(),
+                                                   axis.title.x = element_blank()) , 
+                         phastCons_PADRE_ensambles + theme(legend.position ="none"),
+                         nrow = 2, align = "hv", axis = "rl")
+ggsave2("Figure_5D.pdf",
+        plot_grid(top_row, bottom_rows, get_legend(prom_number_plot), 
+                  nrow = 3, rel_heights = c(1, 2, .1)), 
+        width = 8, height = 8, units = "in", dpi = 300)
+ 
+png("foo.png"); vioplot::vioplot(log10(foo$within_ensemble$per_100kb + 1), log10(foo$outside_ensamble$per_100kb + 1)); dev.off()
+
+padre_number_plot
+```
+
+```{r promoter_distribution}
+
+tadEnsambles <- subsetByOverlaps(domeEnsamble, tads_48hpf)
+tadEnsambles <- tadEnsambles[order(width(tadEnsambles), decreasing = T)]
+
+tadEnsamblesGRL <- split(tadEnsambles, tadEnsambles$name)
+
+bar_start <- lapply(tadEnsamblesGRL,
+              function(x){
+                temp_prom <- subsetByOverlaps(promoters, resize(x,
+                                                                width = 1,
+                                              fix = "start") + 5000)
+                out <- data.frame(distance =
+                                    start(temp_prom) - 
+                                    start(x),
+                                  orient = strand(temp_prom))
+                if(nrow(out)){
+                  out$name <- x$name
+                }
+                out
+              })
+
+p_start <- bar_start %>% { do.call(rbind, .) } %>% 
+  mutate(name = factor(name, levels = rev(tadEnsambles$name))) %>% 
+    ggplot(aes(distance, fill = orient)) + 
+  geom_density(alpha = .4) + 
+    theme_bw() + ggtitle("Left boundary") +
+  scale_fill_manual(values = c("tomato", "navy"))
+
+bar_end <- lapply(tadEnsamblesGRL,
+              function(x){
+                temp_prom <- subsetByOverlaps(promoters, resize(x,
+                                                                width = 1,
+                                              fix = "end") + 5000)
+                out <- data.frame(distance =
+                                    start(temp_prom) - 
+                                    end(x),
+                                  orient = strand(temp_prom))
+                if(nrow(out)){
+                  out$name <- x$name
+                }
+                out
+              })
+
+p_end <-bar_end %>% { do.call(rbind, .) } %>% 
+  mutate(name = factor(name, levels = rev(tadEnsambles$name))) %>% 
+    ggplot(aes(distance, fill = orient)) + 
+  geom_density(alpha = .4) + 
+    theme_bw() + ggtitle("Right boundary") +
+  scale_fill_manual(values = c("tomato", "navy"))
+
+orientation_legend <- get_legend(p_start + theme(legend.position = "bottom"))
+
+boundary_plots <- plot_grid(p_start + theme(legend.position = "none"),
+                            p_end + theme(legend.position = "none",
+                                          axis.title.y = element_blank()))
+
+promoter_density_at_ensamble_boundary <- 
+  plot_grid(boundary_plots, orientation_legend,
+            rel_heights = c(.9, .1), nrow = 2)
+```
+ 
+```{r panelD_alt}
+ 
+quartile_width <- function(x) {
+   m <- median(x)
+   ymin <- quantile(x, .25)
+   ymax <- quantile(x, .75)
+   data.frame(y = m, ymin = ymin, ymax = ymax)
+}
+
+ prom_number_plot <- prom_number_df %>% 
+   ggplot(aes(1, log(per_100kb + 1), colour = ensemble)) +
+   geom_violin(aes(), size = 1, position = position_dodge(width = .4), 
+               width = .45, bw = .4) +
+    stat_summary(fun.data = quartile_width, 
+                 position = position_dodge(width = .4)) +
+   ggtitle("Promoters number") +
+   scale_color_manual(values = c("#ca0020", "#0571b0"))  + theme_classic() + 
+   ylim(c(0, 6)) + xlim(c(.5, 1.5)) +
+   theme(legend.position = "bottom", legend.margin = margin(c(0, 0, 0, 0)),
+         axis.title.x = element_blank(),
+         axis.text.x = element_blank(),
+         axis.ticks.x = element_blank()) 
+
+
+
+padre_number_plot <- padre_number_df %>% filter(time != "none") %>%
+    ggplot(aes(time, log(per_100kb + 1), colour = ensemble)) +
+    geom_violin(size = 1, position = position_dodge(width = .4), width = .45, bw = .4) +
+    stat_summary(fun.data = quartile_width, position = position_dodge(width = .4)) +
+    ggtitle("Distal PADREs number") +
+    theme_classic() + scale_colour_manual(values = c("#ca0020", "#0571b0")) +
+    scale_fill_manual(values = c("#ca0020", "#0571b0")) + ylim(c(0, 6)) +
+  theme(legend.position = "none",
+        axis.title.y = element_blank(),
+         axis.text.y = element_blank(),
+         axis.ticks.y = element_blank())
+
+ensembleLegend <- get_legend(prom_number_plot)
+elNumViols <- plot_grid(plot_grid(prom_number_plot + theme(legend.position = "none"), 
+                                  padre_number_plot, 
+                        rel_widths = c(1, 3), align = "hv", axis = "tb"),
+                        ensembleLegend, nrow = 2, rel_heights = c(.9, .1))
+
+panelD_alt <- plot_grid(sall1aScreenshot, elNumViols, nrow = 2)
+
+regEl_number_df <- bind_rows(list(promoters = prom_number_df,
+                                  PADREs = padre_number_df),
+                             .id = "id")
+grb_nonGRB_difference <-  regEl_number_df %>% 
+    ggplot(aes(id, log(per_100kb + 1), colour = grb)) +
+    geom_violin(size = 1, position = position_dodge(width = .4), width = .45, bw = .4) +
+    stat_summary(fun.data = quartile_width, position = position_dodge(width = .4)) +
+    ggtitle("Regulatory elements number") + facet_grid(. ~ ensemble) +
+    theme_bw() + scale_colour_manual(values = c("#ca0020", "#0571b0")) +
+    scale_fill_manual(values = c("#ca0020", "#0571b0")) +
+  theme(panel.grid = element_blank(), legend.position = "bottom")
+
+# test
+padre_number_df %>% filter((time == "late") & (grb == "non_grb")) %>% 
+  { wilcox.test(per_100kb ~ ensemble, data = ., alternative = "greater") }
+
+
+panelD_2 <- plot_grid(proportionOfTADSwithEnsembles,
+                      grb_nonGRB_difference, 
+                      rel_widths = c(.25, .75))
+
+ensembleStatLegends <- plot_grid(ensembleLegend,
+                                 get_legend(proportionOfTADSwithEnsembles),
+                                 get_legend(grb_nonGRB_difference), nrow = 1)
+
+ensembleViolins <-  plot_grid(plot_grid(prom_number_plot + 
+                                          theme(legend.position = "none"), 
+                                        padre_number_plot, 
+                                        rel_widths = c(1, 3), 
+                                        align = "hv", axis = "tb"),
+                              proportionOfTADSwithEnsembles + 
+                                theme(legend.position = "none"),
+                              grb_nonGRB_difference + 
+                                theme(legend.position = "none"),
+                              rel_widths = c(.45, .1, .45), nrow = 1)
+
+panelD_bottom <- plot_grid(ensembleViolins, ensembleStatLegends, 
+                           rel_heights = c(.9, .1), nrow = 2)
+
+ggsave2("figure5D_v3.pdf", plot_grid(sall1aScreenshot, panelD_bottom, 
+                                     nrow = 2, rel_heights = c(.4, .6)),
+        width = 20, height = 6, units = "in", dpi = 300)
+
+padre_number_plot_final <- padre_number_df %>% filter(time != "none") %>%
+    ggplot(aes(time, log(per_100kb + 1), colour = ensemble)) +
+    geom_violin(size = 1, position = position_dodge(width = .4), width = .45, bw = .4) +
+    stat_summary(fun.data = quartile_width, position = position_dodge(width = .4)) +
+    ggtitle("Distal PADREs number") +
+    theme_classic() + scale_colour_manual(values = c("#ca0020", "#0571b0")) +
+    scale_fill_manual(values = c("#ca0020", "#0571b0")) + 
+  theme(legend.position = "bottom")
+
+panel_e_main_plot <- plot_grid(boundary_plots, 
+                               padre_number_plot_final + 
+                                 theme(legend.position = "none"))
+panel_e_legend <- plot_grid(orientation_legend, 
+                            get_legend(padre_number_plot_final))
+final_panel_e <- plot_grid(panel_e_main_plot, 
+                           panel_e_legend,
+                           nrow = 2, rel_heights = c(.9, .1))
+
+
+```
+
+## D - supplement
+
+## E
+
+## E - supplement
+
+## F
+
+```{r expression}
+
+set.seed(12345)
+ensemble_tc_som_center <- mcols(tad_ensamble_promoters)[, 3:18] %>% 
+  as.matrix() %>% t() %>% base::scale(center = F) %>% t() %>% get_plot_som(3, 3)
+
+m = mcols(tad_ensamble_promoters)[, 3:18] %>% 
+    as.matrix() %>% t() %>% base::scale() %>% t() 
+ht_list = ComplexHeatmap::Heatmap(m, name = "TC expression", cluster_columns = F,
+                  width = unit(6, "cm"),
+                   col = colorRamp2(breaks =
+                               quantile(m, probs = c(.01, .5, .99) ),
+                             colors = viridis(3) ))
+
+ha = HeatmapAnnotation(summary = anno_summary(height = unit(3, "cm")))
+v1 = ifelse(tad_ensamble_promoters %over% (domeEnsamble + 12500), 
+           "within ensemble", 
+           "outside ensemble")
+ht_list = ht_list + ComplexHeatmap::Heatmap(v1, name = "Ensemble assocciation", 
+                            top_annotation = ha,
+                            width = unit(2, "cm"),
+                            col = c("red4", "navyblue"))
+
+ha = HeatmapAnnotation(summary = anno_summary(height = unit(3, "cm")))
+v2 = ifelse(tad_ensamble_promoters %over% grb_tads, 
+           "GRB", 
+           "non GRB")
+ht_list = ht_list + ComplexHeatmap::Heatmap(v2, name = "TAD type", 
+                            top_annotation = ha, 
+                            width = unit(2, "cm"),
+                            col = c("darkgreen", "magenta4"))
+
+split = ensemble_tc_som_center$som$unit.classif
+draw(ht_list, row_split = split, ht_gap = unit(5, "mm"))
+
+bar = ComplexHeatmap::Heatmap(m, name = "TC expression", cluster_columns = F,
+              row_split = ensemble_tc_som_center$som$unit.classif)
+
+foo <- data.frame(Ensemble_assoc = v1, 
+                  tad_type = v2, 
+                  som_class = ensemble_tc_som_center$som$unit.classif)
+
+total_ensemble_assoc <- table(foo$Ensemble_assoc)
+
+fisher <- function(a,b,c,d){
+  data <- matrix(c(a,b,c,d),ncol=2)
+  c(p = fisher.test(data, alternative = "greater")$p.value,
+    OR = fisher.test(data, alternative = "greater")$estimate)
+}
+
+p_val_soms <- foo %>% group_by(som_class, Ensemble_assoc) %>% summarize(n = n()) %>%
+  ungroup() %>% pivot_wider(id_cols = som_class, 
+                            values_from = n, names_from = Ensemble_assoc) %>%
+  group_by(som_class) %>% mutate(
+    outside_rest = total_ensemble_assoc[1] - `outside ensemble`,
+    within_rest = total_ensemble_assoc[2] - `within ensemble`) %>%
+  ungroup() %>% rowwise() %>%
+  mutate(p_val = fisher( `within ensemble`, `outside ensemble`, 
+                            within_rest, outside_rest)[[1]]) %>%
+  ungroup() %>% mutate(q_val = p.adjust(p_val))
+
+fooPlot <- foo %>% group_by(som_class, Ensemble_assoc) %>% 
+  summarize(perc = n()) %>% ungroup() %>% group_by(som_class) %>% 
+  mutate(perc = perc / sum(perc)) %>% ungroup() %>% 
+  ggplot(aes(factor(som_class, levels = c(3, 5, 2, 6, 9, 8, 1, 4, 7)), 
+             perc, fill = Ensemble_assoc)) + 
+  geom_col(position = "stack")  + theme_classic() + 
+  labs(y = "Proportion", x = "SOM class", fill = "Ensamble association") +
+  scale_fill_manual(values = c("#a6d96a", "#d7191c")) + coord_flip()
+
+bazPlot <- foo %>% group_by(som_class, tad_type) %>% 
+  summarize(perc = n()) %>% ungroup() %>% group_by(som_class) %>% 
+  mutate(perc = perc / sum(perc)) %>% ungroup() %>% 
+  ggplot(aes(factor(som_class, levels = c(3, 5, 2, 6, 9, 8, 1, 4, 7)),
+             perc, fill = tad_type)) + 
+  geom_col(position = "stack") + coord_flip() + theme_classic() +
+  labs(fill = "TAD type") + scale_fill_manual(values = c("#5e3c99", "#fdb863"))
+
+mainPlots <- plot_grid(fooPlot + theme(legend.position =  "none"), 
+                       bazPlot + theme(legend.position =  "none",
+                                       axis.text.y = element_blank(),
+                                       axis.title.y = element_blank()), 
+                       nrow = 1)
+
+half_panel <- plot_grid(mainPlots,
+                        plot_grid(get_legend(fooPlot),
+                                  get_legend(bazPlot), nrow = 2, align = "hv"),
+                        nrow = 1, rel_widths = c(5, 1))
+```
+
+## H
+
+```{r}
+
+ge_target_prediction <- read_tsv(
+  "../GRB_dynamics/rawdata/target_gene_prediction/hg38.tsv")
+
+mart <- useMart("ENSEMBL_MART_ENSEMBL")
+dr_dset <- useDataset("drerio_gene_ensembl", mart = mart)
+
+hsapiens_attributes <- dr_dset %>% listAttributes() %>% 
+  filter(str_detect(name, "hsapiens")) %>% dplyr::select(name) %>% pull()
+
+targetGenes <- read_tsv(
+  "~/projects/GRB_dynamics/assets/danRer10_target_genes.tsv")
+promoters_exp <- read_tsv(
+  "data/consens.meanTpmPerStage.canonicalEntireConsCl.df") %>%
+  makeGRangesFromDataFrame(keep.extra.columns = T)
+tad_promoters <- subsetByOverlaps(promoters_exp, tads_48hpf)
+tad_genes <- somTC[as.character(tad_promoters$consensus.cluster)]$EnsG
+target_tc <- ifelse(str_replace(tad_genes, "\\.\\d+", "") %in% 
+                    str_replace(targetGenes$drerio_homolog_ensembl_gene, 
+                                "\\.\\d+", ""), "target", "bystander")
+ensemble_tc <- ifelse(tad_promoters %over% (domeEnsamble + 12500),
+                   "ensemble", "nonEnsemble")
+
+tad_promoters$target_tc <- target_tc 
+tad_promoters$ensemble_tc <- ensemble_tc
+mcols(tad_promoters) <- mcols(tad_promoters)[c(1, 2, 19, 20, c(3:18))]
+mOvlp <- mergeByOverlaps(tad_promoters, tads_48hpf)
+tad_promoters_new <- mOvlp$tad_promoters %T>%
+  { mcols(.) <- mOvlp[ , -c(1, 22)] } %T>%
+  { mcols(.) <- mcols(.)[c(1:4, 21, 22, 5:20)]} %>% unique()
+
+tc_tad_ovlp <- findOverlaps(tad_promoters, tads_48hpf)
+tad_promoters_withGRB <- tad_promoters
+tad_promoters_withGRB$grb[queryHits(tc_tad_ovlp)] <- 
+  tads_48hpf$grb[subjectHits(tc_tad_ovlp)]
+
+grb_promoters <- tad_promoters_new[tad_promoters_new$grb == "grb"]
+
+drerio_grb_tc_ort <- getBM(c("ensembl_gene_id", "external_gene_name", 
+                             hsapiens_attributes[c(1, 2)]), 
+                             filters = "ensembl_gene_id", 
+                             values = somTC[as.character(
+                               grb_promoters$id)]$EnsG %>% 
+                         str_replace("\\.\\d+$", ""), 
+                             mart = dr_dset)
+drerio_target_assignment <- drerio_grb_tc_ort %>% inner_join(
+  ge_target_prediction, by = 
+    c("hsapiens_homolog_ensembl_gene" = "ENSEMBLGeneID"))
+
+grb_promoters_target_updt <- somTC %>% mcols() %>% as.data.frame() %>%
+    dplyr::select(consensus.cluster, EnsG) %>% 
+    mutate(EnsG = str_replace(EnsG, "\\.\\d+$", "")) %>%
+    inner_join(as.data.frame(grb_promoters), by = "consensus.cluster") %>% 
+    inner_join(drerio_target_assignment, 
+              by = c("EnsG" = "ensembl_gene_id")) %>% 
+    relocate(external_gene_name, hsapiens_homolog_ensembl_gene, 
+             hsapiens_homolog_associated_gene_name, ucscCoordinates,
+             geneName, originalSupport, normalisedSupport, prediction,
+             .after = EnsG) %>%
+makeGRangesFromDataFrame(keep.extra.columns = T)
+
+grb_tc_expr_mat_v1 <- as.matrix(mcols(grb_promoters_target_updt[,16:31]))
+
+cage_stages <- colnames(mcols(grb_promoters_target_updt[,16:31]))
+
+grb_promoters_target_updt %>% filter(target_tc == "target") %>%
+    plyranges::select(ensemble_tc, 16:31) %>% mcols() %>% as_tibble() %>%
+    pivot_longer(cols = -ensemble_tc, 
+                 names_to = "stage", values_to = "expression") %>%
+    mutate(stage = factor(stage, levels = cage_stages)) %>%
+    ggplot(aes(stage, log2(expression + 1), 
+               group = ensemble_tc, colour = ensemble_tc)) + 
+  stat_summary() + stat_summary(geom = "line") + theme_bw() + 
+  theme(axis.text.x = element_blank(), axis.title.x = element_blank(),
+        text = element_text(size = 8)) + 
+  scale_color_manual(values = c("red3", "blue4"))
+
+grb_tc_expr_mat_v2 <- as.matrix(mcols(grb_promoters_target_updt[
+  grb_promoters_target_updt$prediction == "target",16:31]))
+
+target_expression_standard_mat_v1 <- grb_tc_expr_mat_v1 %>%
+  t() %>% base::scale() %>% t() %>%
+  { ComplexHeatmap::Heatmap(., cluster_columns = F, show_row_names = F,
+            row_split = grb_promoters_target_updt$ensembles,
+                          row_dend_reorder = T,
+             right_annotation =
+              rowAnnotation(in_ensemble = grb_promoters_target_updt$ensemble_tc,
+                            target = grb_promoters_target_updt$prediction,
+                            col = list(in_ensemble = 
+                                         c(ensemble = "firebrick3", 
+                                           nonEnsemble = "darkolivegreen3"),
+                                       target = 
+                                         c(target = "purple4", 
+                                           bystander = "tan1"))),
+            name ="Z-score") }
+
+hm_list <- grb_promoters_target_updt %>% 
+  split(grb_promoters_target_updt$ensembles) %>% lapply(function(x){
+    norm_mat <- x %>% mcols() %>% as.data.frame() %>% dplyr::select(16:31) %>%
+      as.matrix() %>% t() %>% base::scale() %>% t() 
+    row_ord <- seriate(dist(norm_mat), method = "ARSA")
+    Heatmap(norm_mat, cluster_columns = F, show_row_names = F,
+            row_order = get_order(row_ord),
+             right_annotation =
+              rowAnnotation(in_ensemble = x$ensemble_tc,
+                            target = x$prediction,
+                            col = list(in_ensemble = 
+                                         c(ensemble = "firebrick3", 
+                                           nonEnsemble = "darkolivegreen3"),
+                                       target = 
+                                         c(target = "purple4", 
+                                           bystander = "tan1"))),
+            name = unique(x$ensamble))
+  })
+
+hm_list2 <- grb_promoters_target_updt %>% 
+  split(grb_promoters_target_updt$ensembles) %>% lapply(function(x){
+    norm_mat <- x %>% mcols() %>% as.data.frame() %>% dplyr::select(16:31) %>%
+      as.matrix() %>% t() %>% base::scale() %>% t() 
+    row_ord <- seriate(dist(norm_mat), method = "TSP")
+    Heatmap(norm_mat, cluster_columns = F, show_row_names = F,
+            row_order = get_order(row_ord),
+             right_annotation =
+              rowAnnotation(in_ensemble = x$ensemble_tc,
+                            target = x$prediction,
+                            col = list(in_ensemble = 
+                                         c(ensemble = "firebrick3", 
+                                           nonEnsemble = "darkolivegreen3"),
+                                       target = 
+                                         c(target = "purple4", 
+                                           bystander = "tan1"))),
+            name = unique(x$ensamble))
+  })
+hm_list_alt <- grb_promoters_target_updt %>% 
+  split(grb_promoters_target_updt$ensembles) %>% lapply(function(x){
+    norm_mat <- x %>% mcols() %>% as.data.frame() %>% dplyr::select(16:31) %>%
+      as.matrix() %>% t() %>% base::scale(center = F) %>% t() 
+    row_ord <- seriate(dist(norm_mat), method = "ARSA")
+    Heatmap(norm_mat, cluster_columns = F, show_row_names = F,
+            row_order = get_order(row_ord),
+             right_annotation =
+              rowAnnotation(in_ensemble = x$ensemble_tc,
+                            target = x$prediction,
+                            col = list(in_ensemble = 
+                                         c(ensemble = "firebrick3", 
+                                           nonEnsemble = "darkolivegreen3"),
+                                       target = 
+                                         c(target = "purple4", 
+                                           bystander = "tan1"))),
+            name = unique(x$ensamble))
+  })
+```
+
+```{r Figure_5i}
+
+grbEnsembleSMIdx <- which(as.numeric(rownames(smK27ac_fun$dome)) %in% 
+                            which((tads_ord$ensembles == "Ensemble") & 
+                                    (tads_ord$grb == "grb")))
+
+k27ac_ensemble_grb_list <-  lapply(smK27ac_fun, function(x2){
+    x2@.Data[grbEnsembleSMIdx, ] %>% customWinsorize(probs = c(0, .95)) %>% 
+      { Heatmap(., coords = c(-10^6, 1^6), scale = range(.)) } %>% 
+      smoothHeatmap(sigma = c(2, 3))
+   })
+```

@@ -1,0 +1,6 @@
+dome	H3K27ac	ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000638SQ.USERpanosfirbas.R1.merged.bam
+dome	H3K27me3	ChIP-seq_Skarmeta_Lab_H3K27me3_0002AS.DCD000631SQ.USERpanosfirbas.R1.merged.bam
+dome	H3K4me1		ChIP-seq_Skarmeta_Lab_H3K4me1_0002AS.DCD000657SQ.USERpanosfirbas.R1.merged.bam
+dome	H3K4me3		ChIP-seq_Skarmeta_Lab_H3K4me3_0002AS.DCD000647SQ.USERpanosfirbas.R1.merged.bam
+dome	H3K4me3		ChIP-seq_Skarmeta_Lab_H3K4me3_0002AS.DCD000649SQ.USERpanosfirbas.R1.merged.bam
+

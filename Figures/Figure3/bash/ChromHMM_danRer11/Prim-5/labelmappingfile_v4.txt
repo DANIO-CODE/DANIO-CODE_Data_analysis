@@ -1,0 +1,10 @@
+U1	TssA1
+U2	TssA2
+U3	TssFlank1
+U4	TssFlank2
+U5	EnhA1
+U6	EnhFlank
+U7	EnhWk1
+U8	Pois
+U9	ReprPC
+U10	Quies

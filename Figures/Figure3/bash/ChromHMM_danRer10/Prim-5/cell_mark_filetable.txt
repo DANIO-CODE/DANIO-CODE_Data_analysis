@@ -1,0 +1,10 @@
+prim5	H3K4me3	ChIP-seq_Mueller_lab_H3K4me3_0006AS.DCD001525SQ.USERdunjanik.R1.filt.deduplicated.nodup.bam
+prim5	H3K4me3	ChIP-seq_Mueller_lab_H3K4me3_0006AS.DCD001540SQ.USERdunjanik.R1.filt.deduplicated.nodup.bam
+prim5	H3K27ac	ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000652SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bam
+prim5	H3K27ac	ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000653SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bam
+prim5	H3K27me3	ChIP-seq_Skarmeta_Lab_H3K27me3_0002AS.DCD000632SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bam
+prim5	H3K4me1		ChIP-seq_Skarmeta_Lab_H3K4me1_0002AS.DCD000655SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bam
+prim5	H3K4me3		ChIP-seq_Skarmeta_Lab_H3K4me3_0002AS.DCD000639SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bam
+prim5	H3K4me3		ChIP-seq_Skarmeta_Lab_H3K4me3_0002AS.DCD000642SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bam
+prim5	H3K4me3		ChIP-seq_Bartel_Lab_H3K4me3_0001AS.DCD002370SQ.USERmickael.dong.R1.nodup.bam
+prim5	H3K4me3		ChIP-seq_Bartel_Lab_H3K4me3_0001AS.DCD002371SQ.USERmickael.dong.R1.nodup.bam

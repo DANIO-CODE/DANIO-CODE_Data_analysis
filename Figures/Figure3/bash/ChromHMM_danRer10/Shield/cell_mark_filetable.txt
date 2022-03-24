@@ -1,0 +1,4 @@
+shield	H3K27ac	ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000635SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bam
+shield	H3K27ac	ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000637SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bam
+shield	H3K4me3	ChIP-seq_Skarmeta_Lab_H3K4me3_0002AS.DCD000645SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bam
+shield	H3K4me3	ChIP-seq_Skarmeta_Lab_H3K4me3_0002AS.DCD000648SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bam

@@ -1,0 +1,6 @@
+5-9somites	H3K27ac	ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000634SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bam
+5-9somites	H3K27ac	ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000654SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bam
+5-9somites	H3K4me3	ChIP-seq_Skarmeta_Lab_H3K4me3_0002AS.DCD000641SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bam
+5-9somites	H3K4me3	ChIP-seq_Skarmeta_Lab_H3K4me3_0002AS.DCD000644SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bam
+5-9somites	H3K27me3	Som-K27me3_S10_L001_R1_001.merged.nodup.bam
+5-9somites	H3K4me1		Som-K4me1_S9_L001_R1_001.merged.nodup.bam

@@ -1,0 +1,2 @@
+bud	H3K27ac	ChIP-seq_Zon_Lab_H3K27Ac_0002AS.DCD001011SQ.USERsyang.R1.filt.deduplicated.nodup.bam
+bud	H3K4me3	ChIP-seq_Zon_Lab_H3K4me3_0002AS.DCD001005SQ.USERsyang.R1.filt.deduplicated.nodup.bam

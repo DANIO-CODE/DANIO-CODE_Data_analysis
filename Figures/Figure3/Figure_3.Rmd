@@ -1,0 +1,2006 @@
+---
+title: "Figure 4"
+author: "Damir Baranasic"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r import_libraries, message=FALSE, warning=FALSE}
+
+library(tidyverse)
+library(rtracklayer)
+library(RColorBrewer)
+library(gridExtra)
+library(readxl)
+library(ggsci)
+library(pbapply)
+library(BSgenome.Drerio.UCSC.danRer10)
+library(SummarizedExperiment)
+library(EnrichedHeatmap)
+library(circlize)
+library(genomation)
+library(heatmaps)
+library(UpSetR)
+library(viridis)
+library(corrplot)
+library(cowplot)
+library(GenomicFeatures)
+library(org.Dr.eg.db)
+library(trackViewer)
+library(TxDb.Drerio.UCSC.danRer10.refGene)
+library(Gviz)
+
+```
+In addition to well annotated genes, the genome contains tens of thousands of regulatory elements that can regulate gene expression. Identification of such regualtory elements are challenging. Luckily, to be active, regulatory elements must modify their histone proteins with characteristic covalent modifications. For example, the active chromatin is characterized by acetylation of lysine residue 27 and mono-methylation of lysine residue 4 on the histone protein H3 (H3K27ac and H3K4me3). The modification H3K4me3 is characteristically found on promoters, while H3K27me3 represents polycomb repressed chromatin. Those specific modifications can be localized with ChIP-seq. Using algorithms like ChromHMM, the genome can be segmented into regions containing specific chromatin marks. Using the above-mentioned chromatin marks, we segmented the genome capturing the epigenetic state of the genome in 5 different development stages (Figure 4.1). After optimization, it was found that there are 10 optimal latent states based on the emission parameters of chromatin marks. The states were matched between stages and assigned a function. The identified functional elements were annotated as followed (Figure 3.1, left): 
+
+1. Active TSS 1 (1_TssA1)
+, 
+2. Active TSS 2 (2_TssA2)
+,
+3. TSS Flanking region 1 (3_TssFlank1)
+, 
+4. TSS Flanking region 2 (4_TssFlank2)
+, 
+5. Active enhancer 1 (5_EnhA1)
+, 
+6. Enhancer flanking region (6_EnhFlank)
+,
+7. Primed enhancer (7_Primed), 
+
+8. Poised elements (8_Poised)
+, 
+9. Polycomb repressed regions (9_PcRep)
+, 
+10. Quiescent state (10_Quies)
+
+
+```{r ChromHMM_states, tidy=TRUE, message=FALSE, warning=FALSE}
+
+path <- "/mnt/storage/Damir/ChromHMM"
+stages <- c("Dome", "75-epiboly", "5-9somites", "Prim-5", "High-Pec")
+analyzedStages <- c("Dome", "75-epiboly", "5-9somites", "Prim-5", "Long-Pec")
+folder <- c(rep("ChromHMM_out_v4_reordered", each = 4), 
+          "ChromHMM_out_v4.2_reordered")
+emissionFile <- "emissions_10.txt"
+
+emissionFiles <- str_c(path, stages, folder, emissionFile, sep = "/")
+names(emissionFiles) <- analyzedStages
+
+overlapFiles <- sapply( str_c(path, stages, folder, sep = "/"), list.files, 
+                        pattern = "_10_overlap.txt", full.name = T)
+names(overlapFiles) <- analyzedStages
+
+neighborhoodFiles <- sapply( str_c(path, stages, folder, sep = "/"), list.files, 
+        pattern = "_TSSFlank.*\\.txt", full.name = T)
+names(neighborhoodFiles) <- analyzedStages
+
+allEmissions <- lapply(names(emissionFiles), function(x){
+  read_tsv(emissionFiles[[x]]) %>%
+    mutate(stage = x) %>% relocate(`state (User order)`, stage,
+                                   H3K4me3, H3K27ac, H3K4me1, H3K27me3)
+}) %>% {do.call(rbind, .)}
+
+allStates <- allEmissions %>% pull(`state (User order)`) %>% 
+  unique() %>% str_sort(numeric = T)
+
+allOverlaps <- lapply(analyzedStages, function(x){
+  read_tsv(overlapFiles[[x]]) %>%
+    dplyr::slice(-n()) %>% mutate(stage = x) %T>%
+    {colnames(.)[2:7] <- str_replace(colnames(.)[2:7], 
+                                     pattern = "RefSeq(.+)\\.danRer10.bed.gz",
+                                     replacement = "\\1")} %>%
+    relocate(1, 8, 2:7)
+}) %>% {do.call(rbind, .)} %>% mutate(`state (User order)` = 
+                                        factor(allStates[
+                                          as.numeric(`state (User order)`)],
+                                               levels = allStates))
+
+allNeighbours <- lapply(analyzedStages, function(x){
+  read_tsv(neighborhoodFiles[[x]]) %>%
+    mutate(stage = x) %>%
+    relocate(1, 23, 2:22)
+}) %>% {do.call(rbind, .)}  %>% mutate(`State (User order)` = 
+                                        factor(allStates[`State (User order)` ],
+                                               levels = allStates))
+
+# mat <- read_tsv("/mnt/storage/Damir/ChromHMM/Prim-5/ChromHMM_out_v4_reordered/emissions_10.txt")
+
+allEmissionsPlt <- allEmissions %>% 
+  pivot_longer(cols = -c(1, 2), names_to = "mark", values_to = "Emission") %>%
+  mutate(`state (User order)` = factor(`state (User order)`, levels = 
+                                         str_sort(unique(`state (User order)`),
+                                                  numeric = T, decreasing = T)),
+         mark = 
+           factor(mark,
+                  levels = c("H3K4me3", "H3K27ac", "H3K4me1", "H3K27me3")),
+         stage = factor(stage, levels = analyzedStages)) %>%
+  ggplot(aes(`state (User order)`, mark, fill = Emission)) + geom_tile() +
+  theme_classic() + coord_flip() + facet_grid(~ stage) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45)) +
+    scale_fill_distiller(palette = "Blues", direction = 1) 
+
+allOverlapsPlt <- allOverlaps %>% pivot_longer(cols = -c(1, 2), 
+                             names_to = "Feature",
+                             values_to = "percentage") %>%
+  mutate(Feature = factor(Feature, levels = colnames(allOverlaps)[3:8]),
+         `state (User order)` = factor(`state (User order)`, 
+                                       levels = str_sort(
+                                         unique(
+                                           `state (User order)`), 
+                                         numeric = T, decreasing = T)),
+         stage = factor(stage, levels = analyzedStages)) %>%
+  ggplot(aes(`state (User order)`, Feature, fill = percentage)) + geom_tile() +
+  scale_fill_distiller(palette = "Blues", direction = 1, 
+                       values = c(seq(0, .5, .1), .5, 1)) + theme_classic() + 
+  coord_flip() + theme(axis.text.x = element_text(hjust = 1, angle = 45)) + 
+  facet_grid(~ stage)
+
+allNeighboirsPlt <- allNeighbours %>% pivot_longer(cols = -c(1, 2), 
+                                     names_to = "Position", 
+                                     values_to = "percentage") %>%
+  mutate(Position = as.numeric(Position), 
+         `State (User order)` = 
+           factor(`State (User order)`, 
+                  levels = str_sort(unique(`State (User order)`), 
+                                    numeric = T, decreasing = T)),
+         stage = factor(stage, levels = analyzedStages)) %>% 
+  ggplot(aes(`State (User order)`, Position, fill = percentage)) + 
+  geom_tile() + theme_classic() + coord_flip() +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45)) + 
+  scale_fill_distiller(palette = "Blues", direction = 1) + facet_grid(~ stage)
+
+prim5_emission <- allEmissions %>%  filter(stage == "Prim-5") %>%
+  pivot_longer(cols = -c(1, 2), names_to = "mark", values_to = "Emission") %>%
+  mutate(`state (User order)` = factor(`state (User order)`, levels = 
+                                         str_sort(unique(`state (User order)`),
+                                                  numeric = T, decreasing = T)),
+         mark = 
+           factor(mark,
+                  levels = c("H3K4me3", "H3K27ac", "H3K4me1", "H3K27me3")),
+         stage = factor(stage, levels = analyzedStages)) %>%
+  ggplot(aes(`state (User order)`, mark, fill = Emission)) + geom_tile() +
+  theme_classic() + coord_flip() +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45)) +
+    scale_fill_distiller(palette = "Blues", direction = 1) 
+
+prim5_overlap <- allOverlaps %>% filter(stage == "Prim-5") %>%
+  pivot_longer(cols = -c(1, 2), 
+                             names_to = "Feature",
+                             values_to = "percentage") %>%
+  mutate(Feature = factor(Feature, levels = colnames(allOverlaps)[3:8]),
+         `state (User order)` = factor(`state (User order)`, 
+                                       levels = str_sort(
+                                         unique(
+                                           `state (User order)`), 
+                                         numeric = T, decreasing = T)),
+         stage = factor(stage, levels = analyzedStages)) %>%
+  ggplot(aes(Feature, `state (User order)`, fill = percentage)) + geom_tile() +
+  scale_fill_distiller(palette = "Blues", direction = 1, 
+                       values = c(seq(0, .5, .1), .5, 1)) + theme_classic() + 
+  theme(axis.text.x = element_text(hjust = 1, angle = 45),
+        axis.text.y = element_blank(), axis.title.y = element_blank()) 
+
+prim5_neughbours <- allNeighbours %>% filter(stage == "Prim-5") %>%
+  pivot_longer(cols = -c(1, 2), 
+                                     names_to = "Position", 
+                                     values_to = "percentage") %>%
+  mutate(Position = as.numeric(Position), 
+         `State (User order)` = 
+           factor(`State (User order)`, 
+                  levels = str_sort(unique(`State (User order)`), 
+                                    numeric = T, decreasing = T)),
+         stage = factor(stage, levels = analyzedStages)) %>% 
+  ggplot(aes(Position, `State (User order)`, fill = percentage)) + 
+  geom_tile() + theme_classic() + 
+  theme(axis.text.x = element_text(hjust = 1.75, angle = 45),
+        axis.text.y = element_blank(), axis.title.y = element_blank()) + 
+  scale_fill_distiller(palette = "Blues", direction = 1) 
+
+figure_4a <- grid.arrange(prim5_emission, prim5_overlap, prim5_neughbours, 
+                          nrow = 1)
+grid.arrange(allEmissionsPlt, allOverlapsPlt, allNeighboirsPlt, ncol = 1)
+```
+```{r calculate_conservation, cache=TRUE, tidy=TRUE, message=FALSE, warning=FALSE}
+
+pathToSegmentFiles <- "export_tracks"
+segmentFiles <- c(Dome = "dome_ATAC_stageSpecific_ChromHMM_annotation.bed",
+                  Epi75 = "Epi75_ATAC_stageSpecific_ChromHMM_annotation.bed",
+                  Hpf12 = "Hpf12_ATAC_stageSpecific_ChromHMM_annotation.bed",
+                  Prim5 = "prim5_ATAC_stageSpecific_ChromHMM_annotation.bed",
+                  LongPec = "longPec_ATAC_stageSpecific_ChromHMM_annotation.bed")
+segmentFiles <- str_c(pathToSegmentFiles, segmentFiles, sep = "/")
+
+segments <- lapply(segmentFiles, rtracklayer::import)
+names(segments) <- c("Dome", "Epi75", "Hpf12", "Prim5", "LongPec")
+
+path <- "/mnt/storage/Damir/ChromHMM"
+stages <- c("Dome", "75-epiboly", "5-9somites", "Prim-5", "High-Pec")
+analyzedStages <- c("Dome", "75-epiboly", "5-9somites", "Prim-5", "Long-Pec")
+folder <- c(rep("ChromHMM_out_v4_reordered", each = 4), 
+          "ChromHMM_out_v4.2_reordered")
+filePattern <- "dense.bed"
+
+segmentationFiles <- list.files(str_c(path, stages, folder, sep = "/"), 
+                           pattern = filePattern, full.names = T)
+segmentationFiles <- segmentationFiles[c(3, 2, 1, 5, 4)]
+names(segmentationFiles) <- c("Dome", "Epi75", "Hpf12", "Prim5", "LongPec")
+genomeSegments <- lapply(segmentationFiles, import)
+genomeSegmentsSplit <- lapply(genomeSegments, function(x){
+  split(x, x$name)
+})
+
+# phastCons <- rtracklayer::import("https://research.nhgri.nih.gov/manuscripts/Burgess/zebrafish/downloads/NHGRI-1/danRer10/ZV10tracks/ZF_GC_CC_GF.bw")
+# seqlevels(phastCons) <- seqlevels(BSgenome.Drerio.UCSC.danRer10)
+# tmpCons <- coverage(phastCons, weight = "score")
+# 
+# segments <- lapply(segments, function(x){
+#   seqlevels(x) <- seqlevels(BSgenome.Drerio.UCSC.danRer10)
+#   x
+# })
+# 
+# conservation <- pblapply(segments, function(x){
+#   binnedAverage(x, tmpCons, varname = "phastCons")
+# })
+#
+# saveRDS(conservation, "export_tracks/ATAC_chromHMM_with_conservation.RDS")
+
+conservation <- readRDS("export_tracks/ATAC_chromHMM_with_conservation.RDS")
+
+```
+
+```{r Open_chromatin, tidy=TRUE, message=FALSE, warning=FALSE}
+
+plotSegmentNumbers <- function(segments, 
+                               title = "Number of segments per stage",
+                               include.y.axis = T,
+                               show_legend = T){
+  segmentsNumber <- lapply(segments, function(x) {
+    x %>% as.data.frame %>% group_by(name) %>% summarize(n = n())
+  })
+  
+  segmentsNumberDf <- purrr::reduce(segmentsNumber, left_join, by = "name")
+  names(segmentsNumberDf) <- c("name", names(segmentsNumber))
+  
+  segmentsNumberDf %>%  pivot_longer(cols = -1, 
+                                     names_to = "stage", 
+                                     values_to = "number") %>%
+    mutate(name = factor(name, levels = rev(stringr::str_sort(unique(name), 
+                                                              numeric = T))),
+           stage = factor(stage, 
+                          levels = 
+                            rev(c("Dome", "Epi75", 
+                                  "Hpf12", "Prim5", 
+                                  "LongPec")))) %>%
+    ggplot(aes(name, number, fill = stage)) + geom_col(
+      position = "dodge", show.legend = show_legend) + 
+    scale_fill_brewer(palette = "Reds", direction = -1) + 
+    theme_bw() + {if(include.y.axis){
+                                           theme()}else{
+                                           theme(axis.text.y = 
+                                                    element_blank(),
+                                                 axis.title.y = element_blank())
+                                             }} +
+    coord_flip() + ggtitle(title)
+}
+
+  segmentsRecall <- sapply(names(genomeSegmentsSplit), function(x) {
+    sapply(genomeSegmentsSplit[[x]], function(y){
+    sum(y %over% segments[[x]]) / length(y) 
+    })
+  }) %>% as.data.frame() %>% rownames_to_column(var = "name") %>%
+    pivot_longer(cols = -1, names_to = "stage", values_to = "Percentage") %>%
+    mutate(name = factor(name, levels = rev(stringr::str_sort(unique(name), 
+                                                              numeric = T))),
+           stage = factor(stage, 
+                          levels = 
+                            rev(c("Dome", "Epi75", 
+                                  "Hpf12", "Prim5", 
+                                  "LongPec")))) %>%
+        ggplot(aes(name, Percentage, fill = stage)) + geom_col(
+      position = "dodge", show.legend = T) + 
+    scale_fill_brewer(palette = "Reds", direction = -1) + 
+    theme_bw() + 
+    theme(axis.text.y = element_blank(), axis.title.y = element_blank()) +
+    coord_flip() + ggtitle("Proportion of open segments per stage")
+
+# activeSegments <- lapply(segments, function(x){ x %>%
+#   as.data.frame %>%
+#   filter(name != "10_Quies") %>%
+#   makeGRangesFromDataFrame(keep.extra.columns = T)})
+
+cnes <- rtracklayer::import("http://ancora.genereg.net/downloads/danRer10/vs_cavefish/HCNE_danRer10_AstMex102_90pc_50col.bed.gz")
+
+cneSegments <- lapply(segments, function(x) subsetByOverlaps(x, cnes))
+
+humanCNEs <- rtracklayer::import("http://ancora.genereg.net/downloads/danRer10/vs_human/HCNE_danRer10_hg38_70pc_50col.bed.gz")
+
+humanSegments <- lapply(segments, function(x) subsetByOverlaps(x, humanCNEs))
+
+CAGE_enhancers <- readRDS("subset_enhancers_filt.rds")
+CAGE_enhancersGR <- SummarizedExperiment::rowRanges(CAGE_enhancers)
+
+CAGE_enhancers_segments <-  lapply(segments, function(x) {
+  subsetByOverlaps(x, CAGE_enhancersGR)
+  })
+
+# t <- read_xlsx("Zebrafish_Enhancer_Database_2_Pelumi.xlsx", sheet = "ZV10 TRACK")
+# pelumiEnh <- makeGRangesFromDataFrame(t, 
+#                                       start.field = "chromStart", 
+#                                       end = "chromEnd", 
+#                                       keep.extra.columns = TRUE)
+
+yavorEnhancers <- rbind(read_xlsx("EnhancersFinal.xlsx"),
+                        read_xlsx("EnhancersFinal.xlsx",
+                                  sheet = "SepandEnhFinal")) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = T)
+danRer11To10Chain <- import.chain("data/danRer11ToDanRer10.over.chain")
+yavorEnhancersDanRer10 <- unlist(liftOver(yavorEnhancers, danRer11To10Chain))
+
+transgenic <- lapply(segments, function(x) 
+  subsetByOverlaps(x, yavorEnhancersDanRer10))
+
+p1 <- plotSegmentNumbers(segments, show_legend = F)
+p2 <- plotSegmentNumbers(cneSegments, title = "Overlap with cavefish CNEs", 
+                         include.y.axis = T, show_legend = F)
+p3 <- plotSegmentNumbers(humanSegments, title = "Overlap with human CNEs", 
+                         include.y.axis = F, show_legend = T)
+p4 <- plotSegmentNumbers(transgenic, title = "Overlap with transgenically validated sequences",
+                         include.y.axis = T)
+
+p6 <- plotSegmentNumbers(CAGE_enhancers_segments, 
+                         title = "Overlap with CAGE enhancers")
+
+p5 <- conservation %>% names() %>% lapply(function(x){
+  tmp <- conservation[[x]]
+  data.frame(stage = x, name = tmp$name, phastCons = tmp$phastCons)
+}) %>% {do.call(rbind, .)} %>%
+  mutate(name = factor(name, levels = stringr::str_sort(unique(name), 
+                                                              numeric = T)),
+           stage = factor(stage, 
+                          levels = 
+                            c("Dome", "Epi75", 
+                                  "Hpf12", "Prim5", 
+                                  "LongPec"))) %>%
+  ggplot(aes(name, phastCons, fill = stage)) + geom_boxplot() + theme_bw() +
+  scale_fill_brewer(palette = "Reds") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  ggtitle("Average cyprinides PhastCons conservation")
+
+lay <- rbind(c(1, 2, 3),
+             c(4, 4, 4))
+
+grid.arrange(p1, segmentsRecall, p2, p3)
+grid.arrange(p4, p6)
+```
+```{r browser_screenshot}
+
+
+# TxDb.Drerio.UCSC.danRer10.ensGene <- 
+#   makeTxDbFromUCSC(genome = "danRer10", tablename = "ensGene")
+
+sshaLoc <- GRanges("chr7:40603939-40611253:+")
+irx3aLocus <- GRanges("chr7:35714435-35814544")
+
+# ids <- getGeneIDsFromTxDb(sshaLoc + 10000, TxDb.Drerio.UCSC.danRer10.refGene)
+# 
+# # trs <- geneModelFromTxdb(TxDb.Drerio.UCSC.danRer10.ensGene,
+# #                          org.Dr.eg.db,
+# #                          gr=sshaLoc + 20000,
+# #                          as.list = F)
+# 
+# symbols <- mget(ids, org.Dr.egSYMBOL)
+# 
+# genes <- geneTrack(ids, TxDb.Drerio.UCSC.danRer10.refGene, 
+#                    symbols, asList=FALSE)
+# 
+# atac <- importScore("https://danio-code.zfin.org/files/annotated_files/ATAC-seq/DCD000152BS/ATAC-seq_Skarmeta_Lab_0001AS.DCD000394SQ.danRer10.USERpanosfirbas.R1.merged.filt.tn5.rpm.signal.bigwig", format = "BigWig", ranges = sshaLoc + 10000)
+# 
+# atacPeaks <- new("track", dat=segments$Prim5, type="data", format="BED")
+# 
+# trl <- trackList(atacPeaks, atac, genes)
+# # names(trl) <- c("5S_rRNA", "shha", "CU041319.3")
+# 
+# setTrackStyleParam(trl[[1]], "height", .3)
+# setTrackStyleParam(trl[[2]], "height", .4)
+# setTrackStyleParam(trl[[3]], "height", .3)
+# 
+# pdf("browser_view_shha.pdf", height = 3)
+# vp <- viewTracks(trl, 
+#                  gr=sshaLoc + 10000, 
+#                  autoOptimizeStyle=TRUE)
+# dev.off()
+
+foo <- subsetByOverlaps(segments$Prim5, irx3aLocus)
+gTrack <- GenomeAxisTrack()
+genMod <- GeneRegionTrack(TxDb.Drerio.UCSC.danRer10.refGene, 
+                          chromosome = "chr7", start = start(irx3aLocus), 
+                          end = end(irx3aLocus), name = "")
+
+fooAnnoTrack <- AnnotationTrack(foo, name = "ATAC peaks")
+feature(fooAnnoTrack) <- foo$name
+
+subChromHMM <-  subsetByOverlaps(genomeSegments$Prim5, 
+                                             irx3aLocus)
+start(subChromHMM[1]) <- start(irx3aLocus)
+end(subChromHMM[length(subChromHMM)]) <- end(irx3aLocus)
+
+chromHMMTrack <- AnnotationTrack(subChromHMM, 
+                            name = "ChromHMM")
+feature(chromHMMTrack) <- subChromHMM$name
+
+atacLink <- "https://danio-code.zfin.org/files/annotated_files/ATAC-seq/DCD000152BS/ATAC-seq_Skarmeta_Lab_0001AS.DCD000394SQ.danRer10.USERpanosfirbas.R1.merged.filt.tn5.rpm.signal.bigwig"
+atacTrack <-  DataTrack(range = atacLink,
+                      importFunction = function(file) rtracklayer::import(con=file,
+                                                            which = irx3aLocus),
+                      background.title = "brown", fontcolor	= "black", 
+                      name = "ATAC", fill = "navy", 
+                      col.histogram = "navy", type = "hist")
+
+k4triLink <- "https://danio-code.zfin.org/files/annotated_files/ChIP-seq/DCD006675BS/ChIP-seq_Mueller_lab_H3K4me3_0006AS.DCD001540SQ.USERdunjanik.R1.filt.deduplicated.nodup.tagAlign_x_ChIP-seq_Mueller_lab_Mock_0006AS.DCD001542SQ.USERdunjanik.R1.filt.deduplicated.nodup.tagAlign.pval.signal.bw"
+k4triTrack <-  DataTrack(range = k4triLink,
+                      importFunction = function(file) rtracklayer::import(con=file,
+                                                            which = irx3aLocus),
+                      background.title = "brown", fontcolor	= "black", 
+                      name = "H3K4me3", fill = "tomato", 
+                      col.histogram = "tomato", type = "hist")
+
+k27acLink <- "https://danio-code.zfin.org/files/annotated_files/ChIP-seq/DCD006175BS/ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000653SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.pval.signal.bw"
+k27acTrack <-  DataTrack(range = k27acLink,
+                      importFunction = function(file) rtracklayer::import(con=file,
+                                                            which = irx3aLocus),
+                      background.title = "brown", fontcolor	= "black", 
+                      name = "H3K27ac", fill = "darkgreen", 
+                      col.histogram = "darkgreen", type = "hist")
+
+k4monoLink <- "https://danio-code.zfin.org/files/annotated_files/ChIP-seq/DCD006175BS/ChIP-seq_Skarmeta_Lab_H3K4me1_0002AS.DCD000655SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.pval.signal.bw"
+k4monoTrack <-  DataTrack(range = k4monoLink,
+                      importFunction = function(file) rtracklayer::import(con=file,
+                                                            which = irx3aLocus),
+                      background.title = "brown", fontcolor	= "black", 
+                      name = "H3K4me1", fill = "orange", 
+                      col.histogram = "orange", type = "hist")
+
+k27triLink <- "https://danio-code.zfin.org/files/annotated_files/ChIP-seq/DCD006175BS/ChIP-seq_Skarmeta_Lab_H3K27me3_0002AS.DCD000632SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.pval.signal.bw"
+k27triTrack <-  DataTrack(range = k27triLink,
+                      importFunction = function(file) rtracklayer::import(con=file,
+                                                            which = irx3aLocus),
+                      background.title = "brown", fontcolor	= "black", 
+                      name = "H3K27me3", fill = "purple", 
+                      col.histogram = "purple", type = "hist")
+
+plotTracks(list(gTrack, genMod, chromHMMTrack, fooAnnoTrack, atacTrack,
+                k4triTrack, k27acTrack, k4monoTrack, k27triTrack), scale = 0.25, 
+           `1_TssA1` = "#A6CEE3", `2_TssA2` = "#1F78B4", 
+           `3_TssFlank1` = "#33A02C", `4_TssFlank2` = "#B2DF8A",
+           `5_EnhA1` = "#E31A1C", `6_EnhFlank` = "#FB9A99", `6_EnhA2` = "#FB9A99",
+           `7_EnhWk1` = "#FF7F00", `8_Pois` = "#6A3D9A", `8_TssBiv` = "#6A3D9A",
+           `9_ReprPC` =  "#CAB2D6", `10_Quies` = "#A1A2A3", fontcolor.title = 1, 
+           col.axis = 1, background.title = "white",
+           transcriptAnnotation = "symbol", fontcolor.feature = 1, 
+           cex.feature = .5, just.feature = "above")
+
+browser_screenshot <- grid.grabExpr(plotTracks(
+  list(gTrack, genMod,  atacTrack, k4triTrack, k27acTrack, k4monoTrack,
+       k27triTrack, chromHMMTrack, fooAnnoTrack), scale = 0.25, 
+  sizes = c(.05, .05, .08, .08, .08, .08, .08, .3, .15),
+  `1_TssA1` = "#A6CEE3", `2_TssA2` = "#1F78B4", 
+  `3_TssFlank1` = "#33A02C", `4_TssFlank2` = "#B2DF8A",
+  `5_EnhA1` = "#E31A1C", `6_EnhFlank` = "#FB9A99", `6_EnhA2` = "#FB9A99",
+  `7_EnhWk1` = "#FF7F00", `8_Pois` = "#6A3D9A", `8_TssBiv` = "#6A3D9A",
+  `9_ReprPC` =  "#CAB2D6", `10_Quies` = "#A1A2A3", fontcolor.title = 1, 
+  col.axis = 1, background.title = "white",
+  transcriptAnnotation = "symbol", fontcolor.feature = 1, just.feature = "above"))
+  #cex.feature = .5, just.feature = "above", fontzise = 8))
+```
+```{r import_heatmaps, cache=T}
+
+allScoreMatrices <- readRDS("/mnt/storage/Damir/umap_profiles_all_v2.RDS")
+
+prim5CompleteCases <- purrr::reduce(
+  lapply(allScoreMatrices$prim5, rownames), intersect)
+
+prim5CompleteCasesMat <- lapply(allScoreMatrices$prim5, function(x){
+  x[prim5CompleteCases, ]
+})
+
+peakFiles <- list.files("data/open_devel_strict_refinepeak/", full.names = T)
+names(peakFiles) <- c("dome", "Epi75", "Hpf12", "longPec", "prim5", "shield")
+
+peakGranges <- lapply(peakFiles, import)
+
+fishPlotInputs <- list(
+  dome = list(
+    peakRanges = peakGranges$dome,
+    assayFiles =  c(H3K4me3 = "/mnt/orca/damir/DANIO-CODE/DataFreeze_02/ChIP-seq/pipeline_output/DCD006178BS/out/signal/macs2/pooled_rep/ChIP-seq_Skarmeta_Lab_H3K4me3_0002AS.DCD000647SQ.USERpanosfirbas.R1.filt.deduplicated.nodup_pooled.pval.signal.bw",
+                    H3K27ac = "/mnt/storage/Damir/histones_marks/Skarmeta_H3K27ac_Dome_DCD000638SQ/signal/macs2/rep1/ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000638SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.pval.signal.bw",
+                    H3K4me1 = "/mnt/orca/damir/DANIO-CODE/DataFreeze_02/ChIP-seq/pipeline_output/DCD006178BSk4me1/signal/macs2/rep1/ChIP-seq_Skarmeta_Lab_H3K4me1_0002AS.DCD000657SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.pval.signal.bw", 
+                    ATAC = "/mnt/orca/damir/DanRer_ATAC-seq/pipeline_out/atac_dome/signal/macs2/pooled_rep/ATAC_dome_rep1.R1.trim.PE2SE.nodup.tn5_pooled.pf.pval.signal.bigwig")
+    ),
+  
+  Epi75 = list(
+    peakRanges = peakGranges$Epi75,
+    assayFiles = c(H3K4me3 = "/mnt/orca/damir/DANIO-CODE/DataFreeze_02/ChIP-seq/pipeline_output/DCD006177BS/out/signal/macs2/pooled_rep/ChIP-seq_Skarmeta_Lab_H3K4me3_0002AS.DCD000643SQ.USERpanosfirbas.R1.filt.deduplicated.nodup_pooled.pval.signal.bw",
+                   H3K27ac = "/mnt/storage/Damir/temp_histones/H3K27ac/Skarmeta_H3K27ac_75epiboly_1e-2/signal/macs2/pooled_rep/ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000633SQ.USERpanosfirbas.R1.filt.deduplicated.nodup_pooled.pval.signal.bw",
+                   H3K4me1 = "/mnt/storage/Damir/histones_marks/Skarmeta_H3K4me1_75-epiboly_DCD000656SQ/signal/macs2/rep1/ChIP-seq_Skarmeta_Lab_H3K4me1_0002AS.DCD000656SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.pval.signal.bw",
+                    ATAC = "/mnt/orca/damir/DanRer_ATAC-seq/pipeline_out/atac_80epi/signal/macs2/pooled_rep/ATAC_80epi_rep1.R1.trim.PE2SE.nodup.tn5_pooled.pf.pval.signal.bigwig")
+   ),
+  
+  Hpf12 = list(
+    peakRanges = peakGranges$Hpf12,
+    assayFiles = c(H3K4me3 = "/mnt/orca/damir/DANIO-CODE/DataFreeze_02/ChIP-seq/pipeline_output/DCD006174BS/out/signal/macs2/pooled_rep/ChIP-seq_Skarmeta_Lab_H3K4me3_0002AS.DCD000641SQ.USERpanosfirbas.R1.filt.deduplicated.nodup_pooled.pval.signal.bw",
+                   H3K27ac = "/mnt/storage/Damir/temp_histones/H3K27ac/Skarmeta_H3K27ac_59somites_1e-2/signal/macs2/pooled_rep/ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000634SQ.USERpanosfirbas.R1.filt.deduplicated.nodup_pooled.pval.signal.bw",
+                     H3K4me1 = "/mnt/orca/damir/DANIO-CODE/new_samples/caper_test/chip/48ba3a5f-9564-4532-ac1e-f2775cdb625a/call-macs2_signal_track/shard-0/execution/Som-K4me1_S9_L001_R1_001.merged.nodup.pval.signal.bigwig",
+                   ATAC = "/mnt/orca/damir/DanRer_ATAC-seq/pipeline_out/atac_8som/signal/macs2/pooled_rep/ATAC_8som_rep1.R1.PE2SE.nodup.tn5_ATAC_8som_rep2.R1.PE2SE.nodup.tn5.pf.pval.signal.bigwig")
+    ),
+  
+  prim5 = list(
+    peakRanges = peakGranges$prim5,
+    assayFiles = c(H3K4me3 = "/mnt/orca/damir/DanRer_ChIP-seq_H3K4me3/Mueller_Prim-5/out/signal/macs2/pooled_rep/ChIP-seq_Mueller_lab_H3K4me3_0006AS.DCD001525SQ.USERdunjanik.R1.filt.deduplicated.nodup_pooled.tagAlign_x_ChIP-seq_Mueller_lab_Mock_0006AS.DCD001542SQ.USERdunjanik.R1.filt.deduplicated.nodup.tagAlign.pval.signal.bw",
+                   H3K27ac = "/mnt/orca/damir/DANIO-CODE/DataFreeze_02/ChIP-seq/pipeline_output/DCD006175BSk27ac/signal/macs2/rep2/ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000653SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.pval.signal.bw",
+                   H3K4me1 = "/mnt/orca/damir/DANIO-CODE/DataFreeze_02/ChIP-seq/pipeline_output/DCD006175BSk4me1/signal/macs2/rep1/ChIP-seq_Skarmeta_Lab_H3K4me1_0002AS.DCD000655SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.pval.signal.bw",
+                   ATAC =  "/mnt/biggley/home/damir/pipelines/atac_dnase_pipelines/Skarmeta_Lab/signal/macs2/pooled_rep/ATAC-seq_Skarmeta_Lab_0001AS.DCD000394SQ.USERpanosfirbas.R1.trim.PE2SE.nodup.tn5_pooled.pf.pval.signal.bigwig")
+   ),
+  
+  longPec = list(
+    peakRanges = peakGranges$longPec,
+    assayFiles = c(H3K4me3 = "/mnt/orca/damir/DANIO-CODE/DataFreeze_02/ChIP-seq/pipeline_output/DCD006173BS/out/signal/macs2/rep1/ChIP-seq_Skarmeta_Lab_H3K4me3_0002AS.DCD000640SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.pval.signal.bw",
+                   H3K27ac = "/mnt/orca/damir/DANIO-CODE/DataFreeze_02/ChIP-seq/pipeline_output/DCD006173BSk27ac/signal/macs2/rep1/ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000651SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.pval.signal.bw",
+                   H3K4me1 = "/mnt/orca/damir/DANIO-CODE/DataFreeze_02/ChIP-seq/pipeline_output/DCD006173BSk4me1/signal/macs2/rep1/ChIP-seq_Skarmeta_Lab_H3K4me1_0002AS.DCD000650SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.pval.signal.bw",
+                    H3K27ac_new = "/mnt/storage/Damir/new_samples_nov2020/K27ac_48hpf_sig/signal/macs2/rep1/2F_S1_R1_001.PE2SE.nodup.pval.signal.bw",
+                   H3K4me1_new = "/mnt/storage/Damir/new_samples_nov2020/K4me1_48hpf_sig/signal/macs2/rep1/4F_S2_R1_001.PE2SE.nodup.pval.signal.bw",
+                   ATAC = "/mnt/orca/damir/DanRer_ATAC-seq/pipeline_out/atac_48h/signal/macs2/pooled_rep/ATAC_48hpf_rep1.R1.PE2SE.nodup.tn5_ATAC_48hpf_rep2.R1.PE2SE.nodup.tn5.pf.pval.signal.bigwig")
+    )
+  
+)
+
+earlyLateData <- fishPlotInputs[c("dome", "prim5")]
+
+earlyLateEmissions <- lapply(earlyLateData, function(x) {
+  targets <- lapply(x$assayFiles, import)
+  
+  ScoreMatrixList(targets,
+                  x$peakRanges + 2000,
+                  bin.num = 400,
+                  weight.col = "score")
+})
+
+earlyLateEmissions <- readRDS("/mnt/storage/Damir/DANIO-CODE_Figure4_last_panel_scoreMatrix.RDS")
+
+```
+
+```{r umap, tidy=TRUE, message=F, warning=F}
+
+load("failsafe.RData")
+long_pec_update <- readRDS("long_pec_update.RDS")
+modelMatrices$longPec$peaks <- long_pec_update$peaks
+modelMatrices$longPec$modelMatrixStage <- long_pec_update$matrix
+umapAllStages$longPec <- long_pec_update$umap
+
+paper_colors <- c("#A6CEE3", "#1F78B4",   "#33A02C",   "#B2DF8A",   "#E31A1C", 
+                  "#FB9A99" ,  "#FF7F00",   "#6A3D9A",   "#CAB2D6" ,  "#A1A2A3")
+names(paper_colors) <- c("1_TssA1", "2_TssA2", "3_TssFlank1", "4_TssFlank2",
+                         "5_EnhA1", "6_EnhFlank", "7_EnhWk1", 
+                         "8_Pois", "9_ReprPC", "10_Quies" )
+paper_colors_rgb <- apply(col2rgb(paper_colors), 2, str_c, collapse = ",")
+
+umapAllStages$dome[,1] <- -1 * umapAllStages$dome[,1]
+umapAllStages$longPec[,1] <- -1 * umapAllStages$longPec[,1]
+
+segsStage <- lapply(segments, function(x) x$name)
+umapMainPanel <- ggplot(as.data.frame(umapAllStages$prim5), aes(V1, V2)) + 
+  geom_density_2d(color = "#808080") +
+  geom_point(aes(color = segsStage$prim5), alpha = .2, size = .5) + theme_bw() + 
+  labs(x = "UMAP1", y = "UMAP2", colour = "ChromHMM state") + 
+  scale_color_manual(values = paper_colors) +
+  guides(colour = guide_legend(override.aes = list(size=2, alpha = 1)))
+
+names(segsStage) <- names(umapAllStages)
+
+umapPlots <- lapply(names(umapAllStages), function(x){
+  ggplot(as.data.frame(umapAllStages[[x]]), aes(V1, V2)) + 
+  geom_density_2d(color = "#808080") +
+  geom_point(aes(color = segsStage[[x]]), alpha = .2, size = .5) + theme_bw() + 
+  labs(x = "UMAP1", y = "UMAP2", colour = "ChromHMM state") + 
+  scale_color_manual(values = paper_colors) +
+  guides(colour = guide_legend(override.aes = list(size=2, alpha = 1))) +
+    ggtitle(x)
+})
+names(umapPlots) <- names(umapAllStages)
+  
+grid.arrange(umapPlots$dome, umapPlots$Epi75, umapPlots$Hpf12,
+             umapPlots$prim5, umapPlots$longPec)
+
+plot_grid(plot_grid(umapPlots$dome + theme(legend.position = "none"),
+                    umapPlots$Epi75 + theme(legend.position = "none"),
+                    umapPlots$Hpf12 + theme(legend.position = "none"),
+                    umapPlots$prim5 + theme(legend.position = "none"),
+                    umapPlots$longPec + theme(legend.position = "none"),
+                    nrow = 2),
+          get_legend(umapPlots$prim5), nrow = 1, rel_widths = c(.9, .1))
+
+
+phastConsUmap <- ggplot(as.data.frame(umapAllStages$prim5), 
+       aes(V1, V2, color = conservation$Prim5$phastCons)) + 
+  geom_density_2d(color = "#808080") + geom_point(alpha = .2, size = .2) + 
+  scale_color_distiller(palette = "RdYlBu", direction = -1, 
+                        values = c(0, 0.05, 0.12, 0.2, 0.35, 0.5, 1)) + 
+  theme_void() + labs(x = "UMAP1", y = "UMAP2", colour = "PhastCons",
+                         title = "phastCons") 
+
+promoters <- import("data/DANIO-CODE_promoters_consens.canonical.Piotr_v1.bed")
+
+promoterOr <- split(promoters, strand(promoters))
+plusTCUMAP <- umapAllStages$prim5[which(modelMatrices$prim5$peaks %over% 
+                                          promoterOr$`+`), ] %>% 
+  as.data.frame() %>% mutate(strand = "+")
+minusTCUMAP <- umapAllStages$prim5[which(modelMatrices$prim5$peaks %over% 
+                                           promoterOr$`-`), ] %>% 
+  as.data.frame() %>% mutate(strand = "-")
+
+TcUmap <- rbind(plusTCUMAP, minusTCUMAP)
+promoterUmap <- ggplot(as.data.frame(umapAllStages$prim5), aes(V1, V2)) +
+  geom_density_2d(color = "#808080", bins = 5) +
+  geom_jitter(data = TcUmap, 
+             aes(color = strand),
+             alpha = .1, size = .2) + xlab("UMAP1") + ylab("UMAP2") +
+  theme_void() + scale_color_manual(values = c("blue", "red")) + 
+  theme(legend.position = "none") +
+  labs(title = "CAGE Tag clusters") 
+
+# ggplot(as.data.frame(umapAllStages$prim5), aes(V1, V2)) + geom_density_2d() + geom_point(aes(color = segsStage$prim5), alpha = .2, size = .5) + theme_bw() + labs(x = "UMAP1", y = "UMAP2", colour = "ChromHMM state") + scale_color_manual(values = chromHMMColScheme)
+
+ctcf <- import("data/ctcf_danRer10_90pec.bed.gz")
+ctcfOr <- split(ctcf, strand(ctcf))
+plusCtcfUMAP <- umapAllStages$prim5[which(modelMatrices$prim5$peaks %over%
+                                            ctcfOr$`+`), ] %>% 
+  as.data.frame() %>% mutate(strand = "+")
+minusCtcfUMAP <- umapAllStages$prim5[which(modelMatrices$prim5$peaks %over% 
+                                             ctcfOr$`-`), ] %>% 
+  as.data.frame() %>% mutate(strand = "-")
+ctcfUmap <- rbind(plusCtcfUMAP, minusCtcfUMAP)
+ctcfUmapPlt <- ggplot(as.data.frame(umapAllStages$prim5), aes(V1, V2)) + 
+  geom_density_2d(color = "#808080", bins = 5) +
+  geom_jitter(data = ctcfUmap,
+             aes(color = strand), 
+             alpha = .1, size = .2) + 
+  xlab("UMAP1") + ylab("UMAP2") + theme_void() + 
+  scale_color_manual(values = c("blue", "red")) + labs(colour = "Orientation",
+                                                       title = "CTCF motif") +
+  guides(colour = guide_legend(override.aes = list(size=2, alpha = 1)))
+
+humanCneIdx <- which(modelMatrices$prim5$peaks %over% 
+                                             humanCNEs)
+humanCneUmaps <- umapAllStages$prim5[humanCneIdx, ] %>% as.data.frame()
+
+humanCNEColors <- factor(segments$Prim5$name[humanCneIdx],
+                         levels = str_sort(unique(
+                           segments$Prim5$name[humanCneIdx]), numeric = T))
+humanCNEUmap <- ggplot(as.data.frame(umapAllStages$prim5), aes(V1, V2)) +
+  geom_density_2d(color = "#808080", bins = 5) + geom_point(data = humanCneUmaps, 
+                                 aes(color = humanCNEColors),
+                                 size = .5, alpha = 1) + theme_void() + 
+  scale_color_manual(values = paper_colors) + 
+  theme(legend.position = "none") +
+  labs(x = "UMAP1", y = "UMAP2", title = "Human CNEs")
+
+yavorTransgenicIdx <- which(modelMatrices$prim5$peaks %over% 
+                                             yavorEnhancersDanRer10)
+yavorTransgenicUmaps <- umapAllStages$prim5[yavorTransgenicIdx, ] %>% as.data.frame()
+
+yavorTransgenicColors <- factor(segments$Prim5$name[yavorTransgenicIdx],
+                         levels = str_sort(unique(
+                           segments$Prim5$name[yavorTransgenicIdx]), 
+                           numeric = T))
+yavorTransgenicUmap <- ggplot(as.data.frame(umapAllStages$prim5), aes(V1, V2)) +
+  geom_density_2d(color = "#808080", bins = 5) + geom_point(data = yavorTransgenicUmaps, 
+                                 aes(color = yavorTransgenicColors),
+                                 size = .5, alpha = 1) + theme_void() + 
+  scale_color_manual(values = paper_colors) +
+  theme(legend.position = "none") +
+  labs(x = "UMAP1", y = "UMAP2", title = "Transgenically confirmed enhancers")
+
+CAGEEnahncerIdx <- which(modelMatrices$prim5$peaks %over% 
+                                             CAGE_enhancersGR)
+CAGEEnahncerUmaps <- umapAllStages$prim5[CAGEEnahncerIdx, ] %>% as.data.frame()
+
+CAGEEnahncerColors <- factor(segments$Prim5$name[CAGEEnahncerIdx],
+                         levels = str_sort(unique(
+                           segments$Prim5$name[CAGEEnahncerIdx]), 
+                           numeric = T))
+CAGEEnahncerUmap <- ggplot(as.data.frame(umapAllStages$prim5), aes(V1, V2)) +
+  geom_density_2d(color = "#808080", bins = 5) + geom_point(data = CAGEEnahncerUmaps, 
+                                 aes(color = CAGEEnahncerColors),
+                                 size = .5, alpha = 1) + theme_void() + 
+  scale_color_manual(values = paper_colors) +
+  theme(legend.position = "none") +
+  labs(x = "UMAP1", y = "UMAP2", title = "CAGE supported enhancers")
+
+grid.arrange(phastConsUmap, humanCNEUmap, promoterUmap, ctcfUmapPlt, 
+             yavorTransgenicUmap, CAGEEnahncerUmap, ncol = 2)
+
+singleCellAssignment <- read_rds(
+  "/mnt/storage/DANIO-CODE/prim5_scregSeg_assignment.RDS")
+
+# prepare track for Matthias
+tissueSpecificityTrackPrepare <- modelMatrices$prim5$peaks %>% 
+  as.data.frame() %>% cbind(singleCellAssignment[ ,c(4:33)]) %>%
+  pivot_longer(cols = -c(1:11), names_to = "state", values_to = "irv") %>%
+  filter(irv != 0) %>% mutate(name = state) %>% dplyr::select(1:11) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = T) %>% { split(., .$name) }
+
+lapply(names(tissueSpecificityTrackPrepare), function(x){
+    export(tissueSpecificityTrackPrepare[[x]], str_c("tissue_sc_tracks/", x, ".bed"))
+})
+
+singleCellTidy <- singleCellAssignment %>% 
+  pivot_longer(cols = starts_with("state_"), names_to = "screg_seg", values_to = "overlap") %>%
+  filter(overlap > 0)
+
+scUmap <- singleCellTidy %>% filter(screg_seg %in% str_c("state_", c(5, 10, 29))) %>%
+  mutate(screg_seg = factor(screg_seg, 
+                            levels = str_c("state_", c(5, 10, 29)))) %>%
+  ggplot(aes(V1, V2)) + 
+  geom_point(aes(colour = screg_seg), alpha = .5) +
+  geom_density_2d(data = as.data.frame(umapAllStages$prim5), 
+                  colour = "#808080") +
+  theme_void() + labs(x = "UMAP1", y = "UMAP2", colour = "Tissue") +
+  scale_color_manual(labels = c("Brain", "Muscle", "Differentiating neurons"),
+                       values = c("red", "green", "blue"))
+
+# scPrim5 <- segments$Prim5 %>% as.data.frame %>% cbind(singleCellAssignment) %>%
+#    pivot_longer(cols = starts_with("state_"), 
+#                 names_to = "screg_seg", 
+#                 values_to = "overlap") %>% 
+#   filter((overlap > 0) & screg_seg %in% str_c("state_", c(5, 10, 29))) %>%
+#   makeGRangesFromDataFrame(keep.extra.columns = T)
+
+scPrim5 <- modelMatrices$prim5$peaks %>% as.data.frame %>% 
+  cbind(singleCellAssignment) %>%
+   pivot_longer(cols = starts_with("state_"), 
+                names_to = "screg_seg", 
+                values_to = "overlap") %>% 
+  filter((overlap > 0) & screg_seg %in% str_c("state_", c(5, 10, 29))) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = T)
+
+prim5Targets <- lapply(fishPlotInputs$prim5$assayFiles, import)
+scPrim5Summits <- IRanges::shift(scPrim5, shift = scPrim5$peak) %>% 
+  resize(width = 1)
+
+scScoreMatrices <- ScoreMatrixList(prim5Targets,
+                                   scPrim5Summits + 1000,
+                                   weight.col = "score")
+
+scScoreMatrices <- scScoreMatrices[c(4, 1, 2, 3)]
+
+scScoreMatrixScregSeg <- lapply(scScoreMatrices, function(x){
+     scPrim5Summits$screg_seg[as.numeric(rownames(x))]
+})
+
+scScoreMatricesFinal <- scScoreMatrices[-2]
+pdf("prim5_heatmaps_singleCell.pdf");
+scHeatPlt <- grid.grabExpr(multiHeatMatrix(scScoreMatricesFinal, 
+                                           xcoords = c(-1000, 1000),
+                group =  factor(scScoreMatrixScregSeg$ATAC),
+                winsorize = c(0, 95), col = list(brewer.pal(6, "Oranges"),
+                                                 brewer.pal(6, "Oranges"),
+                                                 brewer.pal(6, "Oranges"))));
+ggdraw(scHeatPlt)
+dev.off()
+
+metaplotSc <- lapply(names(scScoreMatricesFinal), function(x) {
+    scScoreMatrices[[x]]@.Data %>% customWinsorize(probs = c(0, .95)) %>%
+      as.data.frame() %>% mutate(tissue =
+                                   scScoreMatrixScregSeg[[x]]) %>%
+      group_by(tissue) %>% summarize(across(everything(), mean)) %>%
+      ungroup %T>% { colnames(.)[2:ncol(.)] <- 1:(ncol(.) - 1) } %>%
+      pivot_longer(-tissue, names_to = "position", values_to = "score") %>%
+      mutate(position = as.numeric(position),
+             # score = (score - min(score)) / (max(score) - min(score)),
+             mark = x)
+  }) %>% { do.call(rbind, .) }
+
+# move_axes_inside <- function(p)
+# {
+#   b <- ggplot_build(p)
+#   x_breaks <- b$layout$panel_scales_x[[1]]$break_info()
+#   y_breaks <- b$layout$panel_scales_y[[1]]$break_info()
+#   x_range <- b$layout$panel_params[[1]]$x.range
+#   y_range <- b$layout$panel_params[[1]]$y.range
+#   y_breaks$major <- diff(y_breaks$range)/diff(y_range) * y_breaks$major + 
+#     (y_breaks$range[1] - y_range[1])/diff(y_range)
+#   x_breaks$major <- diff(x_breaks$range)/diff(x_range) * x_breaks$major + 
+#     (x_breaks$range[1] - x_range[1])/diff(x_range)
+#   y <- grid::yaxisGrob(at = y_breaks$major, label = y_breaks$labels, main = FALSE)
+#   x <- grid::xaxisGrob(at = x_breaks$major, label = x_breaks$labels, main = FALSE)
+#   p + annotation_custom(y, xmin = x_range[1], xmax = x_range[1]) +
+#       annotation_custom(y, ymin = y_range[1], ymax = y_range[1]) +
+#       theme(axis.text.y = element_blank(),
+#             axis.ticks = element_blank(),
+#             axis.text.x = element_blank()
+#             )
+#     
+# }
+
+pdf("figure4e_scProfiles_meta.pdf", height = 2.5)
+scMetaPlt <- metaplotSc %>% 
+  mutate(mark = factor(mark, 
+                        levels = c("ATAC", "H3K4me3", "H3K27ac", "H3K4me1")),
+         tissue = factor(tissue, 
+                         levels = c("state_5", "state_10", "state_29"))) %>%
+    ggplot(aes(position, score, group = tissue, color = tissue)) + 
+    geom_line(size = 1) + facet_wrap(vars(mark), scales = "free_y", nrow = 1) + 
+    theme_bw() + scale_color_manual(values = c("red", "green", "blue"), 
+                                    labels = c("Brain",
+                                               "Muscle", 
+                                               "Differentiating neurons")) +
+    scale_x_continuous(labels = c(-1000, -500, 0, 500, 1000)) + 
+  labs(color = "Tissue") + theme(axis.ticks.length.y = unit(-0.1, "cm"),
+                                 axis.text.y = element_text(hjust = 0,
+                                                            margin = 
+                                                              margin(l = 10,
+                                                                     r = -20)),
+                                 axis.text.x = element_blank(),
+                                 axis.title.x = element_blank())
+scMetaPlt
+dev.off()
+
+```
+
+```{r ctcf_supplement}
+
+ctcfIdx <- findOverlaps(modelMatrices$prim5$peaks,
+                        ctcf)
+
+ctcfWindows <- modelMatrices$prim5$peaks[queryHits(ctcfIdx)] %>%
+  shift(shift = .$peak) %>% resize(width = 1, fix = "start")
+
+strand(ctcfWindows) <- strand(ctcf)[subjectHits(ctcfIdx)]
+
+nucleosome_signal <- import("nucleoATAC_openChromatin_accross_development/prim5.nucleoatac_signal.smooth.bedgraph.gz", which = ctcfWindows + 750)
+
+ctcfSM <- ScoreMatrix(nucleosome_signal, ctcfWindows + 750,
+                      strand.aware = T, weight.col = "score")
+
+kmeansCtcf3 <- kmeans(customWinsorize(ctcfSM@.Data, probs = c(0, .95)), 
+                     centers = 3)$cluster
+
+kmeansCtcf6 <- kmeans(customWinsorize(ctcfSM@.Data, probs = c(0, .95)), 
+                     centers = 6)$cluster
+
+kmeansCtcf <- kmeans(customWinsorize(ctcfSM@.Data, probs = c(0, .95)), 
+                     centers = 4)$cluster
+
+ctcfUmapCoords <- umapAllStages$prim5[queryHits(ctcfIdx)[as.numeric(rownames(ctcfSM))], ]
+
+ctcfClustUmap <- ggplot(as.data.frame(umapAllStages$prim5), aes(V1, V2)) +
+  geom_density_2d() + 
+  geom_point(data = cbind(as.data.frame(ctcfUmapCoords), data.frame(clust = kmeansCtcf)), alpha = .5) +
+  facet_wrap(~ clust, nrow = 2)
+
+ctcfSMwithoutStrand <- ScoreMatrix(nucleosome_signal, ctcfWindows + 750,
+                      strand.aware = F, weight.col = "score")
+
+ctcfUmapCoordsUnaware <- umapAllStages$prim5[queryHits(ctcfIdx)[as.numeric(rownames(ctcfSMwithoutStrand))], ]
+
+kmeansCtcfUnaware <- kmeans(customWinsorize(ctcfSMwithoutStrand@.Data, probs = c(0, .95)), 
+                     centers = 4)$cluster  
+
+ctcfClustUmapUnaware <- ggplot(as.data.frame(umapAllStages$prim5), aes(V1, V2)) +
+  geom_density_2d(colour = "#808080") + 
+  geom_point(data = cbind(as.data.frame(ctcfUmapCoordsUnaware), 
+                          data.frame(clust = factor(kmeansCtcfUnaware))),
+             aes(colour = clust), alpha = .5) + 
+               theme_classic() + labs(x = "UMAP1", y = "UMAP2") +
+  scale_color_manual(values = c("green", "purple", "cyan", "red")) +
+  facet_wrap(~ clust, nrow = 2)
+
+ctcfClustNucHeatmapUnaware <- grid.grabExpr(
+  heatMatrix(ctcfSMwithoutStrand, col = brewer.pal(5, "Blues"), 
+             winsorize = c(0, 95), group = factor(kmeansCtcfUnaware), 
+             xcoords = c(-750, 750), main = "Nucleosome positioning signal")) 
+
+ctcfSupplement <- plot_grid(ctcfClustNucHeatmapUnaware,
+                            ctcfClustUmapUnaware, rel_widths = c(.35, .65),
+                            nrow = 1)
+
+ggsave2("ctcf_supplementary_figure.pdf", ctcfSupplement, width = 14)
+```
+
+```{r SOM_analysis}
+
+promoters <- import("data/DANIO-CODE_promoters_consens.canonical.Piotr_v1.bed")
+pdreFCSE <- readRDS('pdreFCSE.RDS')
+pdreGR <- SummarizedExperiment::rowRanges(pdreFCSE)
+pdre_som <- readRDS("/mnt/storage/Damir/pdre_distal_som_04012021.RDS")
+nonPromoterPdre <- which(!(pdreGR %over%
+                                    resize(promoters,
+                                           width = 1000, fix = "center")))
+
+label_unit <- table(pdre_som$som$unit.classif)
+  tmp_name <- names(label_unit)
+  label_unit <- str_c("Class ", tmp_name, " (", label_unit, ")")
+  names(label_unit) <- tmp_name
+
+tmp_df <- pdre_som$som$data %>% as.data.frame() %>% 
+    {cbind(class = pdre_som$som$unit.classif, .)} %>% 
+  filter(class %in% c( 4,  6, 14)) %>%
+    pivot_longer(cols = !class, 
+                 names_to = "stage", 
+                 values_to = "value") %>% 
+    mutate(stage = factor(stage, 
+                          levels = colnames(pdre_som$som$data[[1]])), 
+           class = factor(class, 
+                          levels = str_sort(unique(class), numeric = T)))
+  sum_stat <- tmp_df %>% group_by(class, stage) %>% 
+    summarize(value = mean(value)) %>% ungroup()
+  
+  label_units_sub <- label_unit[c(4, 6, 14)]
+  
+pdreSOM_stages <- 
+  c("32-cell", "64-cell", "128-cell", "256-cell", "Dome", "30%-Epiboly", 
+    "Shield", "75%-Epiboly", "5-8 somites", "Prim-5", "Long-Pec")
+names(pdreSOM_stages) <- colnames(pdre_som$som$data[[1]])
+
+  out_plot <- tmp_df%>% 
+    ggplot(aes(stage, value)) + geom_violin() + 
+    geom_point(data = sum_stat) + 
+    geom_line(data = sum_stat, aes(group = class)) +
+    facet_wrap(~ class, ncol = 1, labeller = labeller(
+      class = label_unit)) + 
+    theme_bw() + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+    scale_x_discrete(labels = pdreSOM_stages)
+  
+out_plot
+
+```
+
+```{r umap_stages_som}
+
+combine_pdre_stage <- function(x){
+  
+  ovlps <- findOverlaps(modelMatrices[[x]]$peaks, pdreGR[nonPromoterPdre])
+  creIdx <- queryHits(ovlps)
+  pdreIdx <- subjectHits(ovlps)
+  
+  tmpGR <- modelMatrices[[x]]$peaks[creIdx]
+  tmpGR$stage <- x
+  tmpGR$UMAP1 <- umapAllStages[[x]][creIdx, 1]
+  tmpGR$UMAP2 <- umapAllStages[[x]][creIdx, 2]
+  tmpGR$SOM_class <- pdre_som$som$unit.classif[pdreIdx]
+  
+  tmpGR
+  
+}
+
+combine_umaps <- function(x){
+  
+  tmpDf <- as.data.frame(umapAllStages[[x]])
+  colnames(tmpDf) <- c("UMAP1", "UMAP2")
+  tmpDf$stage <- x
+  
+  tmpDf
+}
+
+# umapAllStages$dome[,1] <- -1 * umapAllStages$dome[,1]
+# umapAllStages$longPec[,1] <- -1 * umapAllStages$longPec[,1]
+
+umapCombinedDf <- do.call(rbind, lapply(names(umapAllStages), combine_umaps))
+
+pdreUmapStagesSOM <- lapply(names(modelMatrices), combine_pdre_stage)
+
+# pdreUmapStagesSOM %>% {do.call(c, .)} %>% as.data.frame() %>%
+#   filter(SOM_class %in% c(8, 10, 11, 13)) %>%
+#   ggplot(aes(UMAP1, UMAP2)) + geom_point(size = 2, color = "tomato") + theme_classic() +
+#   facet_wrap(SOM_class ~ stage)
+
+
+
+densityColors <- c("white", brewer.pal(5, "YlOrRd"))
+
+umapStages <- c("dome", "Epi75", "Hpf12", "prim5", "longPec")  
+umapStageLabels <- c("Dome", "75%-Epiboly", "5-9 somites", "Prim-5", "Long-Pec")
+names(umapStageLabels) <- umapStages
+
+umapCombinedDf$stage <- factor(umapCombinedDf$stage,
+                               levels = c("dome", "Epi75", 
+                                  "Hpf12", "prim5", 
+                                  "longPec"))
+umapStages <- c("dome", "Epi75", "Hpf12", "prim5", "longPec")  
+
+somPlots <- pdreUmapStagesSOM %>% {do.call(c, .)} %>% as.data.frame() %>%
+    filter(SOM_class %in% c( 4, 6, 14)) %>%
+    mutate(stage = factor(stage, levels = c("dome", "Epi75", 
+                                  "Hpf12", "prim5", 
+                                  "longPec"))) %>%
+    ggplot(aes(UMAP1, UMAP2)) + stat_density2d_filled(aes(fill = after_stat(level)), bins = 6) +
+geom_density_2d(data = umapCombinedDf, color = "#A1A2A3", bins = 5) + 
+  theme_void() +
+  theme(panel.spacing.x = unit(0, "mm"),
+        strip.text.y = element_blank()) +
+facet_grid(rows = vars(SOM_class), cols = vars(stage),
+           labeller = labeller(stage = umapStageLabels)) + 
+  scale_fill_manual(values = densityColors)
+
+pdf("Figure_4g_PDRE_som_UMAP.pdf", width = 12, height = 5)
+distal_cPADRE_SOM <- plot_grid(out_plot, somPlots, 
+                               rel_widths = c(1, 5), align = "h", axis = "tb")
+distal_cPADRE_SOM
+dev.off()
+```
+
+```{r methylation}
+
+pdre_meth_df <- read_tsv(gzfile("data/pdre_clip_matrix.gz"))
+pdreMethGR <- GRanges(pdre_meth_df$Regions)
+mcols(pdreMethGR) <- pdre_meth_df[ , -1]
+
+som_meth_ovlp <- findOverlaps(pdreGR[nonPromoterPdre], pdreMethGR)
+
+meth_som_classes <- pdre_som$som$unit.classif[queryHits(som_meth_ovlp)]
+
+dist_pdre_meth <- pdre_meth_df[subjectHits(som_meth_ovlp), -1]
+
+methylation_som_df <- cbind(data.frame(SOM_class = meth_som_classes),
+                            dist_pdre_meth)
+
+methylation_som_df %>% 
+  select(-c(Biocap_24hpf, CG_density)) %>%
+  pivot_longer(cols = -1, 
+                                    names_to = "sample", 
+                                    values_to = "percentage") %>%
+  mutate(sample = factor(sample, levels = colnames(
+    methylation_som_df)[2:21])) %>%
+  ggplot(aes(sample, percentage)) + geom_boxplot() + 
+  facet_wrap(~ SOM_class, as.table = F) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45))
+
+pdre_width_gc <- data.frame(SOM_class = meth_som_classes,
+                            CG_density =  methylation_som_df$CG_density,
+                            width = width(
+                              pdreMethGR[subjectHits(som_meth_ovlp)]),
+                            Biocap_24hpf = methylation_som_df$Biocap_24hpf,
+                            hmC_per_C = methylation_som_df$OB_24HPF_TAB)
+
+pdre_width_gc %>% pivot_longer(cols = -1, 
+                               names_to = "measure",
+                               values_to = "value") %>%
+  ggplot(aes(as.factor(SOM_class), value)) + geom_boxplot() + 
+  facet_wrap(~ measure, scales = "free_y")
+
+methylation_som_df %>% 
+  select(c(1, 11, 12, 13, 14, 15, 17)) %>%
+  pivot_longer(cols = -1, 
+                                    names_to = "sample", 
+                                    values_to = "percentage") %>%
+  group_by(SOM_class, sample) %>% 
+  summarise(tibble(values = seq(0, 1, .01),
+                   percentiles = ecdf(percentage)(seq(0, 1, .01)))) %>%
+  ungroup() %>%
+  mutate(sample = factor(sample, levels = rev(colnames(
+    methylation_som_df)[2:21]))) %>%
+  ggplot(aes(values, sample)) + geom_raster(aes(fill = percentiles)) + 
+  facet_wrap(~ SOM_class, as.table = F) +
+  theme_bw() + scale_fill_viridis(option = "C")
+                                                           
+```
+
+```{r sc_tissue_specificity}
+
+# requires pdre_som, umpaAllStages, finalAssignmentScregSeg for pdre!!!
+
+peaksOverlapT <- readRDS(
+  "/mnt/storage/Damir/scregSeg_pdre_overlap.RDS") 
+
+state_names <- names(peaksOverlapT[[1]])
+
+peaksOverlapTClean <- lapply(peaksOverlapT, function(x){
+  if (is.list(x)){
+    tmp <- rep(FALSE, times = length(state_names))
+    names(tmp) <- state_names
+    tmp
+  } else{
+    x
+  }
+})
+
+peaksOverlapTCleanMerged <- lapply(peaksOverlapTClean, function(x){
+  if (length(dim(x)) > 0){
+    apply(x, 2, any)
+  } else{
+    x
+  }
+  
+})
+
+finalAssignmentsScregSeg <- do.call(rbind, peaksOverlapTCleanMerged)
+
+finalAssignmentsScregSegNum <- ifelse(finalAssignmentsScregSeg, 1, 0)
+distalPdreScAssignment <- finalAssignmentsScregSegNum[nonPromoterPdre, ]
+
+pdre_som_sc <- cbind(data.frame(SOM_class = pdre_som$som$unit.classif),
+                     as.data.frame(distalPdreScAssignment))
+
+k <- table(pdre_som_sc$SOM_class)
+m <- colSums(pdre_som_sc[,-1])
+n <- sum(m) - m
+
+pdre_som_counts <- pdre_som_sc %>% group_by(SOM_class) %>% 
+  summarise(across(everything(), sum))  
+
+annotated_states <- str_c("state_",
+                          c(5, 29, 4, 14, 18, 24, 25, 26, 10, 3, 13, 23, 21, 20,
+                            1, 12, 16))
+
+chi_sq_som_pdre <- pdre_som_counts %>%
+  select(starts_with("state_")) %>%
+  chisq.test()
+
+chi_sq_som_pdre_anno <- pdre_som_counts %>%
+  select(annotated_states) %>%
+  chisq.test()
+
+corrplot(chi_sq_som_pdre$residuals, is.corr = FALSE)
+corrplot(chi_sq_som_pdre_anno$residuals, is.corr = FALSE)
+
+
+summarized_som_sc <- pdre_som_sc %>% pivot_longer(cols = starts_with("state_"), 
+                                                  names_to = "scregSeg",
+                                                  values_to = "count") %>%
+  filter(count != 0) %>% select(SOM_class, scregSeg) %>%
+  group_by(SOM_class, scregSeg) %>% summarize(count = n()) %>%
+   ungroup() %>%
+   mutate(p_val = phyper(q = count - 1,
+                         m = m[scregSeg],
+                         n = n[scregSeg],
+                         k = k[SOM_class], lower.tail = F),
+          ration = count / k[SOM_class])
+
+tissue_SOM_pdre_plt <- summarized_som_sc %>%
+  filter(p_val <= 0.01) %>%
+  arrange(SOM_class, ration) %>% mutate(order = row_number()) %>%
+  {ggplot(., aes(ration, order, color = p_val)) + 
+      geom_point(aes(size = count)) +
+  facet_wrap(~ SOM_class, as.table = F, scales = "free_y") +
+   scale_y_continuous(breaks = .$order,
+                      labels = .$scregSeg,
+                      expand = c(0, 0))} +
+  scale_color_distiller(palette =  "RdBu", direction = 1)
+
+```
+
+```{r heatmaps}
+
+# pdreIdx <- as.numeric()
+# set.seed(2212)
+# sampleIdx <- sample(1:length(creIdx), replace = F, 
+#                     size = floor(0.1 * length(creIdx)))
+# creIdxSample <- creIdx[sampleIdx]
+# pdreIdxSample <- pdreIdx[sampleIdx]
+# 
+# prim5PdreDistalProfiles <- lapply(
+#   allScoreMatrices$prim5$pdre, function(x) x[creIdxSample, ])
+# prim5PdreDistalClasses <- pdre_som$som$unit.classif[pdreIdxSample]
+# 
+# pdreNormMat <- lapply(prim5PdreDistalProfiles, function(x){
+#   mat <- x
+#   attr(mat, "upstream_index") = 1:750
+#   attr(mat, "downstream_index") = 751:1500
+#   attr(mat, "target_index") = integer(0)
+#   attr(mat, "extend") = c(750, 750)  # it must be a vector of length two
+#   class(mat) = c("normalizedMatrix", "matrix")
+#   mat
+#   
+# })
+# 
+# col_fun <- colorRamp2(quantile(pdreNormMat$ATAC, probs = c(0, .95)),
+#                       c("white", "navy"))
+# 
+# lgd <- Legend(at = as.character(1:16), title = "Clusters", 
+#     type = "lines", legend_gp = gpar(col = 2:17))
+# 
+# ht <- EnrichedHeatmap(pdreNormMat$ATAC, row_split = prim5PdreDistalClasses, 
+#                 col = col_fun,
+#                 top_annotation =
+#                   HeatmapAnnotation(enriched = 
+#                                       anno_enriched(gp = gpar(col = 2:17))))
+# 
+# draw(ht, annotation_legend_list = list(lgd))
+
+# early vs late
+
+# earlyLateIdx <- which( pdre_som$som$unit.classif[pdreIdx] %in% c(4, 14))
+# pdreClass <- c("4" = "early", "14" = "late")[
+#   as.character(pdre_som$som$unit.classif[pdreIdx][earlyLateIdx])]
+
+earlyLateEmissionsFinal <- lapply(earlyLateEmissions, function(x) x[c(4, 2, 3)])
+earlyLateEmissionsFinal <- lapply(earlyLateEmissionsFinal, 
+                                  intersectScoreMatrixList)
+
+customWinsorize <- function(x, probs = c(0, .99)){
+  vals <- quantile(x, probs = probs)
+  tmp <- x
+  tmp[x < vals[1]] <- vals[1]
+  tmp[x > vals[2]] <- vals[2]
+  tmp
+}
+
+profileSOMPrim5 <- lapply(
+  earlyLateEmissionsFinal$prim5, function(x){
+    tmpIntersect <- intersect(
+      as.character(nonPromoterPdre), rownames(x)
+    )
+    idx <- match(tmpIntersect, as.character(nonPromoterPdre))
+    mat <- x[tmpIntersect, ]
+    # attr(mat, "upstream_index") = 1:500
+    # attr(mat, "downstream_index") = 501:1000
+    # attr(mat, "target_index") = integer(0)
+    # attr(mat, "extend") = c(5000, 5000)  # it must be a vector of length two
+    # class(mat) = c("normalizedMatrix", "matrix")
+    
+    list(SOM = pdre_som$som$unit.classif[idx],
+         score_matrix = mat)
+  })
+
+#set.seed(44587863)
+sampleIdx <- which(profileSOMPrim5$ATAC$SOM %in% c(4, 6, 14))
+smRownameIdx <- rownames(profileSOMPrim5$ATAC$score_matrix)[sampleIdx]
+matOrder <- order(profileSOMPrim5$ATAC$SOM[sampleIdx])
+ 
+# col_fun <- colorRamp2(quantile(profileSOMPrim5$ATAC$score_matrix, 
+#                                probs = c(0, 0.25, .95)),
+#                       c("white", "white", "navy"))
+
+smMatSample <- lapply(profileSOMPrim5, function(x){
+  tmp <- x$score_matrix[smRownameIdx, ]
+  tmp[matOrder, ]
+})
+
+
+ehMatSample <- lapply(smMatSample, function(x){
+  mat <- customWinsorize(x@.Data, probs = c(0, .95))
+  # mat <- apply(mat, 1, function(y) {
+  #   mod <- loess(y ~ c(1:length(y)))
+  #   predict(mod)
+  #   })
+  mat <- image(heatmaps::smoothHeatmap(
+     heatmaps::Heatmap(mat[matOrder, ])))
+  attr(mat, "upstream_index") = 1:200
+  attr(mat, "downstream_index") = 201:400
+  attr(mat, "target_index") = integer(0)
+  attr(mat, "extend") = c(2000, 2000)  # it must be a vector of length two
+  class(mat) = c("normalizedMatrix", "matrix")
+  mat
+})
+
+smMatSample <- as(smMatSample, Class = "ScoreMatrixList")
+#smMatSample <- smMatSample[c(4, 1, 2, 3)]
+
+# classIndexList <- factor(profileSOMPrim5$ATAC$SOM[sampleIdx], 
+# levels = sort(unique(profileSOMPrim5$ATAC$SOM[sampleIdx])))
+
+
+#pdf("prim5_heatmaps_earlylate.pdf");
+prim5_heatmap <- grid.grabExpr(multiHeatMatrix(smMatSample, xcoords = c(-2000, 2000),
+                group =  factor(sort(profileSOMPrim5$ATAC$SOM[sampleIdx])),
+                winsorize = c(0, 95), col = list(brewer.pal(6, "Blues"),
+                                                 brewer.pal(6, "Greens"),
+                                                 brewer.pal(6, "Oranges"))))
+
+#dev.off()
+
+metaPlotsPrim5 <- lapply(names(smMatSample), function(x) {
+  smMatSample[[x]]@.Data %>% customWinsorize(probs = c(0, .95)) %>% 
+    as.data.frame() %>% mutate(class = 
+                                 sort(profileSOMPrim5$ATAC$SOM[sampleIdx])) %>%
+    group_by(class) %>% summarize(across(everything(), mean)) %>% 
+    ungroup %T>% { colnames(.)[2:ncol(.)] <- 1:(ncol(.) - 1) } %>% 
+    pivot_longer(-class, names_to = "position", values_to = "score") %>% 
+    mutate(position = as.numeric(position), 
+           score = (score - min(score)) / (max(score) - min(score)), 
+           mark = x)
+}) %>% { do.call(rbind, .) } %>% mutate(stage = "Prim-5")
+
+# lgd <- Legend(at = as.character(c(4, 6, 14)), title = "Clusters",
+#     type = "lines", legend_gp = gpar(col = 2:17))
+
+# sample_smoothed_matrices <- lapply(profileSOMPrim5, function(x){
+#   tmp <- x$score_matrix[sampleIdx, ]
+#    mat <- image(heatmaps::smoothHeatmap(
+#      heatmaps::Heatmap(tmp@.Data[matOrder, ])))
+#    attr(mat, "upstream_index") = 1:500
+#     attr(mat, "downstream_index") = 501:1000
+#     attr(mat, "target_index") = integer(0)
+#     attr(mat, "extend") = c(5000, 5000)  # it must be a vector of length two
+#     class(mat) = c("normalizedMatrix", "matrix")
+#     
+#   mat  
+# })
+
+# ht <- EnrichedHeatmap(ehMatSample$ATAC, 
+#                       row_split = sort(profileSOMPrim5$ATAC$SOM[sampleIdx]),
+#                       row_order = 1:nrow(ehMatSample$ATAC),
+#                       col = c("white", "navy"),
+#                       top_annotation =
+#                           HeatmapAnnotation(enriched =
+#                                             anno_enriched(gp =
+#                                                             gpar(col = 2:17)))) +
+#   
+#  EnrichedHeatmap(ehMatSample$H3K4me3, 
+#                       row_split = sort(profileSOMPrim5$ATAC$SOM[sampleIdx]),
+#                       row_order = 1:nrow(ehMatSample$H3K4me3),
+#                       col = c("white", "tomato"),
+#                       top_annotation =
+#                           HeatmapAnnotation(enriched =
+#                                             anno_enriched(gp =
+#                                                             gpar(col = 2:17)))) +
+#   EnrichedHeatmap(ehMatSample$H3K27ac, 
+#                       row_split = sort(profileSOMPrim5$ATAC$SOM[sampleIdx]),
+#                       row_order = 1:nrow(ehMatSample$H3K27ac),
+#                       col =  c("white", "dark green"),
+#                       top_annotation =
+#                           HeatmapAnnotation(enriched =
+#                                             anno_enriched(gp =
+#                                                             gpar(col = 2:17)))) +
+#   EnrichedHeatmap(ehMatSample$H3K4me1, 
+#                       row_split = sort(profileSOMPrim5$ATAC$SOM[sampleIdx]),
+#                       row_order = 1:nrow(ehMatSample$H3K4me1),
+#                       col = c("white", "orange"),
+#                       top_annotation =
+#                           HeatmapAnnotation(enriched =
+#                                             anno_enriched(gp =
+#                                                             gpar(col = 2:17)))) 
+# 
+# pdf("early_late_enrichedHeatmap.pdf")
+# draw(ht, annotation_legend_list = list(lgd))
+# dev.off()
+
+profileSOMDome <- lapply(
+  earlyLateEmissionsFinal$dome, function(x){
+    tmpIntersect <- intersect(
+      as.character(nonPromoterPdre), rownames(x)
+    )
+    idx <- match(tmpIntersect, as.character(nonPromoterPdre))
+    mat <- x[tmpIntersect, ]
+    # attr(mat, "upstream_index") = 1:500
+    # attr(mat, "downstream_index") = 501:1000
+    # attr(mat, "target_index") = integer(0)
+    # attr(mat, "extend") = c(5000, 5000)  # it must be a vector of length two
+    # class(mat) = c("normalizedMatrix", "matrix")
+    
+    list(SOM = pdre_som$som$unit.classif[idx],
+         score_matrix = mat)
+  })
+
+sampleIdxDome <- which(profileSOMDome$ATAC$SOM %in% c(4, 6, 14))
+smRownameIdxDome <- rownames(profileSOMDome$ATAC$score_matrix)[sampleIdxDome]
+matOrderDome <- order(profileSOMDome$ATAC$SOM[sampleIdxDome])
+ 
+
+smMatSampleDome <- lapply(profileSOMDome, function(x){
+  tmp <- x$score_matrix[smRownameIdxDome, ]
+  tmp[matOrderDome, ]
+})
+
+smMatSampleDome <- as(smMatSampleDome, Class = "ScoreMatrixList")
+#smMatSampleDome <- smMatSampleDome[c(4, 1, 2, 3)]
+
+#pdf("dome_heatmaps_earlylate.pdf");
+dome_heatmap <- grid.grabExpr(multiHeatMatrix(smMatSampleDome, 
+                                              xcoords = c(-2000, 2000),
+                group = factor(sort(profileSOMDome$ATAC$SOM[sampleIdxDome])),
+                winsorize = c(0, 95), col = list(brewer.pal(6, "Blues"), 
+                                                 brewer.pal(6, "Greens"),
+                                                 brewer.pal(6, "Oranges"))))
+
+metaPlotsDome <- lapply(names(smMatSampleDome), function(x) {
+  smMatSampleDome[[x]]@.Data %>% customWinsorize(probs = c(0, .95)) %>% 
+    as.data.frame() %>% mutate(class = 
+                                 sort(profileSOMDome$ATAC$SOM[sampleIdxDome])) %>%
+    group_by(class) %>% summarize(across(everything(), mean)) %>% 
+    ungroup %T>% { colnames(.)[2:ncol(.)] <- 1:(ncol(.) - 1) } %>% 
+    pivot_longer(-class, names_to = "position", values_to = "score") %>% 
+    mutate(position = as.numeric(position),
+           score = 
+                               (score - min(score)) / (max(score) - min(score)),
+           mark = x)
+}) %>% { do.call(rbind, .) } %>% mutate(stage = "Dome")
+
+#ehMatSampleDome <- lapply(smMatSampleDome, function(x){
+#   mat <- customWinsorize(x@.Data, probs = c(0, .95))
+#   # mat <- apply(mat, 1, function(y) {
+#   #   mod <- loess(y ~ c(1:length(y)))
+#   #   predict(mod)
+#   #   })
+#   mat <- image(heatmaps::smoothHeatmap(
+#      heatmaps::Heatmap(mat[matOrderDome, ])))
+#   attr(mat, "upstream_index") = 1:200
+#   attr(mat, "downstream_index") = 201:400
+#   attr(mat, "target_index") = integer(0)
+#   attr(mat, "extend") = c(2000, 2000)  # it must be a vector of length two
+#   class(mat) = c("normalizedMatrix", "matrix")
+#   mat
+# })
+# 
+# ht_dome <- EnrichedHeatmap(ehMatSampleDome$ATAC, 
+#                       row_split = sort(profileSOMDome$ATAC$SOM[sampleIdxDome]),
+#                       row_order = 1:nrow(ehMatSampleDome$ATAC),
+#                       col = c("white", "navy"),
+#                       top_annotation =
+#                           HeatmapAnnotation(enriched =
+#                                             anno_enriched(gp =
+#                                                             gpar(col = 2:17)))) +
+#   
+#  EnrichedHeatmap(ehMatSampleDome$H3K4me3, 
+#                       row_split = sort(profileSOMDome$ATAC$SOM[sampleIdxDome]),
+#                       row_order = 1:nrow(ehMatSampleDome$H3K4me3),
+#                       col = c("white", "tomato"),
+#                       top_annotation =
+#                           HeatmapAnnotation(enriched =
+#                                             anno_enriched(gp =
+#                                                             gpar(col = 2:17)))) +
+#   EnrichedHeatmap(ehMatSampleDome$H3K27ac, 
+#                       row_split = sort(profileSOMDome$ATAC$SOM[sampleIdxDome]),
+#                       row_order = 1:nrow(ehMatSampleDome$H3K27ac),
+#                       col =  c("white", "dark green"),
+#                       top_annotation =
+#                           HeatmapAnnotation(enriched =
+#                                             anno_enriched(gp =
+#                                                             gpar(col = 2:17)))) +
+#   EnrichedHeatmap(ehMatSampleDome$H3K4me1, 
+#                       row_split = sort(profileSOMDome$ATAC$SOM[sampleIdxDome]),
+#                       row_order = 1:nrow(ehMatSampleDome$H3K4me1),
+#                       col = c("white", "orange"),
+#                       top_annotation =
+#                           HeatmapAnnotation(enriched =
+#                                             anno_enriched(gp =
+#                                                             gpar(col = 2:17)))) 
+# 
+# pdf("early_late_enrichedHeatmap_dome.pdf")
+# draw(ht_dome, annotation_legend_list = list(lgd))
+# dev.off()
+
+metaPlots <- rbind(metaPlotsDome, metaPlotsPrim5)
+
+#pdf("early_late_meta_plots.pdf", width = 4, height = 6)
+early_late_meta <- metaPlots %>% 
+  ggplot(aes(position, score, group = mark, color = mark)) + 
+  geom_line(size = 1) + facet_grid(class ~ stage) + theme_bw() + 
+  scale_color_manual(values = c("#08519c", "#006d2c", "#e6550d")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_continuous(labels = c(-2000, -1000, 0, 1000, 2000))
+#dev.off()
+
+```
+```{r COPEs}
+
+reduceOverlappingPeaks <- function(x, y) {
+  IRanges::reduce(c(x[x %over% y], y[y %over% x]))
+}
+
+stageSpecificPeaks <- lapply(modelMatrices, function(x) {
+  x$peaks
+})
+
+stageSpecificDistalPeaks <- lapply(modelMatrices, function(x) {
+  subsetByOverlaps(x$peaks, promoters, invert = T)
+})
+constitutives <- purrr::reduce(stageSpecificDistalPeaks, reduceOverlappingPeaks)
+
+quiescent <- lapply(segments, function(x){
+  x %>% as.data.frame() %>% filter(name == "10_Quies") %>% 
+  GRanges()
+  })
+
+allQuies <- purrr::reduce(quiescent, IRanges::union) %>% IRanges::reduce()
+allQuiesOvlp <- lapply(quiescent, function(x) which(allQuies %over% x))
+
+upset(fromList(allQuiesOvlp))
+
+# allQuiesOvlp
+# 
+# openQuies <- sapply(quiescent, function(x) allQuies %over% x)
+# allQuies[apply(openQuies, 1, all)]
+
+
+copes <- purrr::reduce(quiescent, reduceOverlappingPeaks)
+
+constitutives$cope <- "nonCope"
+constitutives$cope[constitutives %over% copes] <- "cope"
+
+# constOvlp <- sapply(fishPlotInputs, function(x){
+#     constitutives %over% x$peakRanges
+# })
+# 
+# constComplete <- constitutives[apply(constOvlp, 1, all)]
+
+emissionWindows <- lapply(fishPlotInputs, function(x){
+  ovlp <- findOverlaps(x$peakRanges, constitutives)
+  tmp <- x$peakRanges[queryHits(ovlp)]
+  # tmp$cope <- constitutives[subjectHits(ovlp)]$cope
+  # promOvlp <- findOverlaps(tmp, promoters)
+  # strand(tmp) <- "+"
+  # strand(tmp)[queryHits(promOvlp)] <- strand(promoters)[subjectHits(promOvlp)]
+  tmp$cope <- constitutives$cope[subjectHits(ovlp)]
+  tmp
+})
+
+copeEmissions <- lapply(names(fishPlotInputs), function(x) {
+  targets <- lapply(fishPlotInputs[[x]]$assayFiles, import)
+  
+  ScoreMatrixList(targets,
+                  emissionWindows[[x]] + 2000,
+                  # strand.aware = T,
+                  bin.num = 400,
+                  weight.col = "score")
+})
+
+names(copeEmissions) <- names(fishPlotInputs)
+
+lapply(names(copeEmissions), function(x){
+  tmp <-  copeEmissions[[x]]
+  pdf(str_c(x, "_cope_heatmap.pdf"))
+  grp <- emissionWindows[[x]]$cope[as.numeric(rownames(tmp$ATAC))]
+  multiHeatMatrix(tmp, xcoords = c(-2000, 2000),
+                  group = factor(grp),
+                winsorize = c(0, 95), col = list(brewer.pal(6, "Blues"),
+                                                 brewer.pal(6, "Reds"),
+                                                 brewer.pal(6, "Greens"),
+                                                 brewer.pal(6, "Oranges")));
+  dev.off()
+})
+
+copeUmaps <- lapply(names(umapAllStages), function(x){
+  umapAllStages[[x]] %>% as.data.frame() %>%
+    ggplot(aes(V1, V2)) + geom_density_2d() +
+    geom_point(data = as.data.frame(umapAllStages[[x]][
+      which(stageSpecificPeaks[[x]] %over% copes), 
+    ]), alpha = .5, colour = "tomato") + theme_classic() +
+    xlab("UMAP1") + ylab("UMAP2")
+})
+
+pdf("cope_umaps.pdf", height = 20)
+grid.arrange(copeUmaps[[1]], copeUmaps[[2]], copeUmaps[[3]],
+             copeUmaps[[4]], copeUmaps[[5]], ncol = 1)
+dev.off()
+
+metaplotCopes <- lapply(names(copeEmissions), function(y){
+  lapply(names(copeEmissions[[y]]), function(x) {
+    copeEmissions[[y]][[x]]@.Data %>% customWinsorize(probs = c(0, .95)) %>%
+      as.data.frame() %>% mutate(class =
+                                   emissionWindows[[y]]$cope[
+                                     as.numeric(
+                                       rownames(
+                                         copeEmissions[[y]][[x]]))]) %>%
+      group_by(class) %>% summarize(across(everything(), mean)) %>%
+      ungroup %T>% { colnames(.)[2:ncol(.)] <- 1:(ncol(.) - 1) } %>%
+      pivot_longer(-class, names_to = "position", values_to = "score") %>%
+      mutate(position = as.numeric(position),
+             # score = (score - min(score)) / (max(score) - min(score)),
+             mark = x)
+  }) %>% { do.call(rbind, .) } %>% mutate(stage = y)
+}) %>% { do.call(rbind, .) }
+
+metaplotCopes %>% 
+  mutate(stage = factor(stage, levels = 
+                          c("dome", "Epi75", "Hpf12", "prim5", "longPec"))) %>%
+  ggplot(aes(position, score, group = class, color = class)) + 
+  geom_line(aes(linetype = class), size = 1) + facet_grid(mark ~ stage, scales = "free") + 
+  theme_bw() + scale_color_manual(values = c("red3", "navyblue")) +
+  scale_x_continuous(labels = c(-2000, -1000, 0, 1000, 2000))
+
+```
+
+```{r COPEs_methylation}
+
+methCOPEsOvlp <- findOverlaps(constitutives, pdreMethGR)
+
+COPEsMeth <- cbind(data.frame(
+  COPEs = constitutives$cope[queryHits(methCOPEsOvlp)]),
+  as.data.frame(mcols(pdreMethGR[subjectHits(methCOPEsOvlp)]))) %>%
+  select(-c(Biocap_24hpf, CG_density)) %>%
+  pivot_longer(cols = -1, names_to = "sample", values_to = "methylation") %>%
+    mutate(sample = 
+             factor(sample, levels = colnames(methylation_som_df)[2:21])) %>%
+  ggplot(aes(sample, methylation, fill = COPEs)) + geom_boxplot() + 
+  theme(axis.text.x = element_text(hjust = 1, angle = 45))
+ 
+```
+
+```{r dopes}
+
+pathToSegmentFiles <- "export_tracks"
+pdreChromHMMFiles <- c(Dome = "dome_pdre_ChromHMM_annotation.bed",
+                  Epi75 = "Epi75_pdre_ChromHMM_annotation.bed",
+                  Hpf12 = "Hpf12_pdre_ChromHMM_annotation.bed",
+                  Prim5 = "prim5_pdre_ChromHMM_annotation.bed",
+                  LongPec = "longPec_pdre_ChromHMM_annotation.bed")
+pdreChromHMMFiles <- str_c(pathToSegmentFiles, pdreChromHMMFiles, sep = "/")
+
+pdreSegments <- lapply(pdreChromHMMFiles, rtracklayer::import)
+names(pdreSegments) <- c("Dome", "Epi75", "Hpf12", "Prim5", "LongPec")
+
+pdreSegmentsMat <- sapply(pdreSegments, function(x) x$name)
+pdreSegmentsMatDistal <- pdreSegmentsMat[nonPromoterPdre, ]
+nonPromoterPdreGR <- pdreGR[nonPromoterPdre]
+nonPromoterPdreGR$SOM_class <- pdre_som$som$unit.classif
+mcols(nonPromoterPdreGR) <- cbind(mcols(nonPromoterPdreGR), pdreSegmentsMatDistal)
+
+dopeIndex <- which(apply(pdreSegmentsMat, 1,
+                         function(x){
+                           all(x == "10_Quies")
+                         }))
+
+dopes <- pdreGR[dopeIndex]
+
+#dope openess
+
+atacPeakFiles <- list.files("data/ATAC_peaks_timecourse/", full.names = TRUE)
+names(atacPeakFiles) <- c("c128", "c256", "c32", "c64", "LongPec", "Epi75pec",
+                          "Hpf12", "Dome", "Shield", "Epi30pec", "Prim5")
+
+orderedStages <- c("c32", "c64", "c128", "c256", "Dome", "Epi30pec", "Shield",
+                   "Epi75pec", "Hpf12", "Prim5", "LongPec")
+
+atacPeakFiles <- atacPeakFiles[orderedStages]
+
+importUniqueNarrowPeak <- function(file){
+  tmp <- import(file)
+  tmp <- tmp[order(tmp$pValue, decreasing = TRUE)]
+  unique(tmp)
+}
+
+allPeaks <- lapply(atacPeakFiles, importUniqueNarrowPeak)
+allPeaks <- as(allPeaks, Class = "GRangesList")
+
+dopeOpeness <- sapply(allPeaks, function(x){
+  dopes %over% x
+})
+
+hpfs <- c(1.75, 2, 2.25, 2.5, 4.3, 4.7, 6, 8, 12, 24, 48)
+hpfsMat <- matrix(rep(hpfs, times = length(dopes)), byrow = T,
+                  nrow = length(dopes))
+
+hpfsDopeOpeneness <- hpfsMat
+hpfsDopeOpeneness[!dopeOpeness] <- 0
+dopeRowOrder <- order(rowSums(hpfsDopeOpeneness), decreasing = T)
+
+dopeOpenessBinar <- ifelse(dopeOpeness, 1, 0)
+
+ComplexHeatmap::Heatmap(dopeOpenessBinar, 
+                        row_order = dopeRowOrder,
+                        cluster_columns = F, 
+                        column_title = "DOPE openess", 
+                        name = "Open")
+
+hm <- assay(pdreFCSE[which(pdreGR %over% dopes), ]) %>% 
+  t() %>% base::scale(center = F) %>% t()  %>%
+  ComplexHeatmap::Heatmap(name = "DOPEs", cluster_columns = F,
+                          km = 3)
+
+
+```
+
+
+
+```{r dopes_adult}
+
+adultK27acLinks <- c(testis = "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE134nnn/GSE134055/suppl/GSE134055_YueLab-ChIP-seq-Testis_H3K27ac_merged.narrowPeak.gz",
+                spleen = "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE134nnn/GSE134055/suppl/GSE134055_YueLab-ChIP-seq-Spleen_H3K27ac_merged.narrowPeak.gz",
+                skin = "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE134nnn/GSE134055/suppl/GSE134055_YueLab-ChIP-seq-Skin_H3K27ac_merged.narrowPeak.gz",
+                muscle = "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE134nnn/GSE134055/suppl/GSE134055_YueLab-ChIP-seq-Muscle_H3K27ac_merged.narrowPeak.gz",
+                liver = "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE134nnn/GSE134055/suppl/GSE134055_YueLab-ChIP-seq-Liver_H3K27ac_merged.narrowPeak.gz",
+                kidney = "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE134nnn/GSE134055/suppl/GSE134055_YueLab-ChIP-seq-Kidney_H3K27ac_merged.narrowPeak.gz",
+                intenstine = "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE134nnn/GSE134055/suppl/GSE134055_YueLab-ChIP-seq-Intestine_H3K27ac_merged.narrowPeak.gz",
+                heart = "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE134nnn/GSE134055/suppl/GSE134055_YueLab-ChIP-seq-Heart_H3K27ac_merged.narrowPeak.gz",
+                colon = "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE134nnn/GSE134055/suppl/GSE134055_YueLab-ChIP-seq-Colon_H3K27ac_merged.narrowPeak.gz",
+                brain = "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE134nnn/GSE134055/suppl/GSE134055_YueLab-ChIP-seq-Brain_H3K27ac_merged.narrowPeak.gz")
+
+adultK27ac <- lapply(adultK27acLinks, import)
+
+upsetDopes <- lapply(adultK27ac, function(x) which(dopes %over% x))
+upsetCopes <- lapply(adultK27ac, function(x) which(copes %over% x))
+upset(fromList(upsetCopes), nsets = 10)
+upset(fromList(upsetDopes), nsets = 10)
+
+
+adultK27acMerged <- IRanges::reduce(unlist(as(adultK27ac, 
+                                              Class = "GRangesList")))
+
+adultMarkedDopes <- (pdreGR[which(pdreGR %over% dopes), ]) %over% 
+  adultK27acMerged
+
+main_hm <- assay(pdreFCSE[which(pdreGR %over% dopes), ]) %>% 
+  t() %>% base::scale() %>% t()  %>%
+  ComplexHeatmap::Heatmap(name = "DOPEs", cluster_columns = F,
+                          km = 4, right_annotation = 
+                            rowAnnotation(adult = adultMarkedDopes))
+adult_hm <- ComplexHeatmap::Heatmap(as.matrix(adultMarkedDopes), col = c("TRUE" = "red", "FALSE" = "blue"))
+                        # top_annotation = HeatmapAnnotation(summary = 
+                        # anno_summary()))
+
+draw(main_hm + adult_hm)
+
+dopes$adult <- ifelse(dopes %over% adultK27acMerged, "adult_marked", "quiescent")
+dopesWOCopes <- subsetByOverlaps(dopes, constitutives, invert = T)
+
+emissionWindowsDope <- lapply(modelMatrices, function(x){
+  ovlp <- findOverlaps(x$peaks, dopesWOCopes)
+  tmp <- x$peaks[queryHits(ovlp)]
+  # tmp$cope <- constitutives[subjectHits(ovlp)]$cope
+  # promOvlp <- findOverlaps(tmp, promoters)
+  # strand(tmp) <- "+"
+  # strand(tmp)[queryHits(promOvlp)] <- strand(promoters)[subjectHits(promOvlp)]
+  tmp$adult <- dopesWOCopes$adult[subjectHits(ovlp)]
+  resize(shift(tmp, shift = tmp$peak), width = 1, fix = "start")
+})
+
+dopeEmissions <- lapply(names(fishPlotInputs), function(x) {
+  targets <- lapply(fishPlotInputs[[x]]$assayFiles, import)
+  
+  ScoreMatrixList(targets,
+                  emissionWindowsDope[[x]] + 2000,
+                  # strand.aware = T,
+                  bin.num = 400,
+                  weight.col = "score")
+})
+
+names(dopeEmissions) <- names(fishPlotInputs)
+
+lapply(names(dopeEmissions), function(x){
+  tmp <-  intersectScoreMatrixList(dopeEmissions[[x]])
+  pdf(str_c(x, "_dope_heatmap.pdf"))
+  grp <- emissionWindowsDope[[x]]$adult[as.numeric(rownames(tmp$ATAC))]
+  multiHeatMatrix(tmp, xcoords = c(-2000, 2000),
+                  group = factor(grp),
+                winsorize = c(0, 95), col = list(brewer.pal(6, "Blues"),
+                                                 brewer.pal(6, "Reds"),
+                                                 brewer.pal(6, "Greens"),
+                                                 brewer.pal(6, "Oranges")));
+  dev.off()
+})
+
+
+metaplotDopes <- lapply(names(dopeEmissions), function(y){
+  lapply(names(dopeEmissions[[y]]), function(x) {
+    dopeEmissions[[y]][[x]]@.Data %>% customWinsorize(probs = c(0, .95)) %>%
+      as.data.frame() %>% mutate(class =
+                                   emissionWindowsDope[[y]]$adult[
+                                     as.numeric(
+                                       rownames(
+                                         dopeEmissions[[y]][[x]]))]) %>%
+      group_by(class) %>% summarize(across(everything(), mean)) %>%
+      ungroup %T>% { colnames(.)[2:ncol(.)] <- 1:(ncol(.) - 1) } %>%
+      pivot_longer(-class, names_to = "position", values_to = "score") %>%
+      mutate(position = as.numeric(position),
+             # score = (score - min(score)) / (max(score) - min(score)),
+             mark = x)
+  }) %>% { do.call(rbind, .) } %>% mutate(stage = y)
+}) %>% { do.call(rbind, .) }
+
+metaplotDopes %>% 
+  mutate(stage = factor(stage, levels = 
+                          c("dome", "Epi75", "Hpf12", "prim5", "longPec"))) %>%
+  ggplot(aes(position, score, group = class, color = class)) + 
+  geom_line(aes(linetype = class), size = 1) + facet_grid(mark ~ stage, scales = "free") + 
+  theme_bw() + scale_color_brewer(palette = "Set2") +
+  scale_x_continuous(labels = c(-2000, -1000, 0, 1000, 2000))
+
+dopesCopesPanel <- metaplotDopes %>%  rbind(metaplotCopes) %>%
+    filter(mark != "H3K4me3") %>%
+    mutate(stage = factor(stage, levels = 
+                              c("dome", "Epi75", "Hpf12", "prim5", "longPec")),
+           class = factor(class, levels =  c("nonCope", "cope", "adult_marked", "quiescent" ) )) %>%
+    group_by(stage, mark) %>% mutate(score = (score - min(score))  / (max(score) - min(score))) %>%
+    ggplot(aes(position, score, group = class, color = class)) + 
+    geom_line(size = 1, alpha = .4) + facet_grid(mark ~ stage, scales = "free") + 
+    theme_bw() + scale_color_brewer(palette = "Dark2") + 
+    scale_x_continuous(labels = c(-2000, -1000, 0, 1000, 2000)) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45), 
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+dopesWOCopes$type <- dopesWOCopes$adult
+constitutives$type <- constitutives$cope
+dopesCopesConstitutives <- c(dopesWOCopes, constitutives)
+
+doCoCoOvlp <- findOverlaps(modelMatrices$prim5$peaks, dopes)
+doCoCoUmap <- umapAllStages$prim5[queryHits(doCoCoOvlp), ]
+doCoCoType <- dopes$type[subjectHits(doCoCoOvlp)]
+doCoCoType <- factor(doCoCoType, levels = c("copes", "adult_marked", "quiescent" ))
+
+doCoCoUmapPlt <- umapAllStages$prim5 %>% as.data.frame() %>%
+    ggplot(aes(V1, V2)) + geom_density_2d(color = "#808080", bins = 5) +
+    geom_point(data = cbind(as.data.frame(doCoCoUmap), data.frame(type = doCoCoType)),
+                aes(colour = type), size = .5, alpha = .5) + 
+    theme_void() + xlab("UMAP1") + ylab("UMAP2") + facet_wrap( ~ type, ncol = 1) +
+    scale_color_manual(values = brewer.pal(4, "Dark2")[2:4]) + 
+  theme(legend.position = "none")
+
+
+```
+
+```{r cope_dope_emission_for_supplement}
+
+emissionWindowsAll <- lapply(fishPlotInputs, function(x){
+  ovlp <- findOverlaps(x$peakRanges, dopesCopesConstitutives)
+  tmp <- x$peakRanges[queryHits(ovlp)]
+  # tmp$cope <- constitutives[subjectHits(ovlp)]$cope
+  # promOvlp <- findOverlaps(tmp, promoters)
+  # strand(tmp) <- "+"
+  # strand(tmp)[queryHits(promOvlp)] <- strand(promoters)[subjectHits(promOvlp)]
+  tmp$type <- dopesCopesConstitutives$type[subjectHits(ovlp)]
+  tmp
+})
+
+copeDopeEmissions <- lapply(names(fishPlotInputs), function(x) {
+  targets <- lapply(fishPlotInputs[[x]]$assayFiles, import)
+  
+  ScoreMatrixList(targets,
+                  emissionWindowsAll[[x]] + 2000,
+                  # strand.aware = T,
+                  bin.num = 400,
+                  weight.col = "score")
+})
+
+names(copeDopeEmissions) <- names(fishPlotInputs)
+
+lapply(names(copeDopeEmissions), function(x){
+  tmp <-  intersectScoreMatrixList(copeDopeEmissions[[x]])
+  pdf(str_c(x, "_dope_heatmap.pdf"))
+  grp <- emissionWindowsAll[[x]]$type[as.numeric(rownames(tmp$ATAC))]
+  multiHeatMatrix(tmp, xcoords = c(-2000, 2000),
+                  group = factor(grp),
+                winsorize = c(0, 95), col = list(brewer.pal(6, "Blues"),
+                                                 brewer.pal(6, "Reds"),
+                                                 brewer.pal(6, "Greens"),
+                                                 brewer.pal(6, "Oranges")));
+  dev.off()
+})
+
+```
+
+```{r figure5_reminder}
+
+tads_48hpf %>% as.data.frame() %>% group_by(grb, ensembles) %>% summarize(count = n()) %>% ungroup() %>% group_by(grb) %>% mutate(percentage = count / sum(count)) %>% ggplot(aes(grb, percentage, fill = ensembles)) + geom_col() + theme_classic() + scale_fill_manual(values = c("tomato", "royalblue")) + geom_signif(comparisons = list(c("grb", "non_grb")), annotations = "***", y_position = 1.05, tip_length = .01, vjust=0.4)
+
+```
+
+```{r putting_main_together}
+
+first_row <-  plot_grid(browser_screenshot, prim5_emission, 
+                        rel_widths = c(3, 1), labels = c("A", "B"))
+
+orient_legend <- get_legend(ctcfUmapPlt)
+umap_validations <- plot_grid(promoterUmap, ctcfUmapPlt + 
+                                theme(legend.position = "none"),
+                              CAGEEnahncerUmap, yavorTransgenicUmap,
+                              nrow = 2, labels = c("D", "E", "F", "G"), 
+                              align = "hv", vjust = 0)
+umap_validations_full <- plot_grid(umap_validations, orient_legend, 
+                                   rel_widths = c(.85, .15))
+
+second_row <- plot_grid(umapMainPanel, umap_validations_full, labels = "C",
+                        rel_widths = c(.6, .4))
+
+# scHeatPlt <- grid.grabExpr(multiHeatMatrix(scScoreMatrices, xcoords = c(-1000, 1000),
+#                                            group =  factor(scScoreMatrixScregSeg$ATAC),
+#                                            winsorize = c(0, 95), 
+#                                            col = list(brewer.pal(6, "Blues"),
+#                                                       brewer.pal(6, "Reds"),
+#                                                       brewer.pal(6, "Greens"),
+#                                                       brewer.pal(6, "Oranges"))))
+lgd <- get_legend(scMetaPlt)
+
+sc_panel <- plot_grid(scMetaPlt + theme(legend.position = "none"), scHeatPlt,
+                      nrow = 2, align = "hv", 
+                      rel_heights = c(1, 2), axis = "lr")
+
+enhancer_phastcons_old <- conservation %>% names() %>% lapply(function(x){
+  tmp <- conservation[[x]]
+  data.frame(stage = x, name = tmp$name, phastCons = tmp$phastCons)
+}) %>% {do.call(rbind, .)} %>%
+  filter(name == "5_EnhA1") %>%
+  mutate(name = factor(name, levels = stringr::str_sort(unique(name), 
+                                                              numeric = T)),
+           stage = factor(stage, 
+                          levels = 
+                            c("Dome", "Epi75", 
+                                  "Hpf12", "Prim5", 
+                                  "LongPec"))) %>%
+  ggplot(aes(name, phastCons, fill = stage)) + 
+  geom_violin(draw_quantiles = c(.25,.5, .75), bw = .01) + 
+  theme_bw() + scale_fill_brewer(palette = "Reds") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  ggtitle("Average cyprinides PhastCons conservation")
+
+enhancer_phastcons <- conservation %>% names() %>% lapply(function(x){
+  tmp <- conservation[[x]]
+  data.frame(stage = x, name = tmp$name, phastCons = tmp$phastCons)
+}) %>% {do.call(rbind, .)} %>%
+  filter(name == "5_EnhA1") %>%
+  mutate(name = factor(name, levels = stringr::str_sort(unique(name),
+                                                        numeric = T)),
+         stage = factor(stage,
+                        levels =
+                          c("Dome", "Epi75",
+                            "Hpf12", "Prim5",
+                            "LongPec"))) %>%
+  group_by(stage) %>%
+  summarize(lower_quart = quantile(phastCons, .25),
+            upper_quart = quantile(phastCons, .75), 
+            phastCons = mean(phastCons)) %>%
+  ggplot(aes(stage, phastCons)) +
+  geom_line(aes(group = 1), colour = "#E31A1C", size = 1.5) + 
+  geom_point(colour = "#E31A1C", size = 4) +
+  geom_segment(aes(xend = stage, y = lower_quart, 
+                   yend = upper_quart), 
+               colour = "#E31A1C", size = 1.5, alpha = .3) +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("EnhA1 PADREs")
+
+
+typ <- c(rep("promoter", times = 4), rep("enhancer", times = 3), 
+         rep("polycomb", times = 2), "quiescent")
+names(typ) <- stringr::str_sort(unique(conservation$Prim5$name), numeric = T)
+
+prim5PhastCons <- conservation$Prim5
+prim5PhastCons$type <- typ[prim5PhastCons$name]
+
+group_combos <- list(c("promoter", "enhancer"), c("promoter", "polycomb"), c("promoter", "quiescent"), c("enhancer", "polycomb"), c("enhancer", "quiescent"), c("polycomb", "quiescent"))
+group_combos %>% map(function(x) prim5PhastCons %>% as.data.frame() %>% filter(type %in% x) %>% { t.test(log(phastCons + .01) ~ type, data = .)$p.value }) %>% unlist() %>% p.adjust()
+
+
+chromHMM_phastcons <- conservation %>% names() %>% lapply(function(x){
+  tmp <- conservation[[x]]
+  data.frame(stage = x, name = tmp$name, phastCons = tmp$phastCons)
+}) %>% {do.call(rbind, .)} %>%
+  filter(stage == "Prim5") %>%
+  mutate(name = factor(name, levels = stringr::str_sort(unique(name), 
+                                                              numeric = T)),
+         type = typ[name]) %>%
+  ggplot(aes(name, phastCons, colour = type)) + 
+  geom_violin(draw_quantiles = .5, size = 1.5) + 
+  theme_bw() + scale_color_npg() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  ggtitle("PADREs conservation per group at Prim-5")
+
+conservationUmaps <- plot_grid(humanCNEUmap, phastConsUmap)
+conservationStats <- plot_grid(enhancer_phastcons, chromHMM_phastcons,
+                               rel_widths = c(.2, .8))
+conservation_panel <- plot_grid(conservationUmaps, conservationStats, nrow = 2)
+
+third_row <- plot_grid(sc_panel, conservation_panel, 
+                       nrow = 1, rel_widths = c(.4, .6), labels = c("H", "I"))
+
+fourth_row <- plot_grid(distal_cPADRE_SOM, 
+                        plot_grid(prim5_heatmap, dome_heatmap, 
+                                  early_late_meta, nrow = 1),
+                        rel_widths = c(.6, .4), nrow = 1)
+
+
+fifth_row <- plot_grid(copeUmaps[[4]], dopesCopesPanel)
+
+ggsave2("Figure4_v2.1.png", plot_grid(first_row, second_row, third_row,
+                             fourth_row, fifth_row, nrow = 5, 
+                             rel_heights = c(.125, .25, .25, .25, .125)), 
+        width = 16, height = 20, dpi = 300)
+
+orientation_legend <- get_legend(ctcfUmapPlt)
+phastConsLegend <- get_legend(phastConsUmap)
+
+ggsave2("foo.pdf", plot_grid(browser_screenshot, umapMainPanel + theme(legend.position = "none"), prim5_emission, nrow = 1, rel_widths = c(.3, .5, .2)), width = 20, height = 5, dpi = 300, unit = "in")
+
+ggsave2("Figure4D-Htop_v3.pdf",plot_grid(plot_grid(promoterUmap, ctcfUmapPlt + theme(legend.position = "none"), CAGEEnahncerUmap, yavorTransgenicUmap, humanCNEUmap, phastConsUmap + theme(legend.position = "none"), ncol = 2), plot_grid(orientation_legend, phastConsLegend, ncol = 1), rel_widths = c(.85, .15), ncol = 2), width = 8, height = 5, units = "in", dpi = 300)
+
+ggsave2("Figure4Hbottom_v3.pdf", conservationStats, width = 8, height = 5, units = "in", dpi = 300)
+
+ggsave2("Figure4Ileft_v3.pdf", sc_panel, width = 5, height = 5, units = "in", dpi = 300)
+
+ggsave2("Figure4Jtop_v3.pdf", distal_cPADRE_SOM, width = 12, height = 6, units = "in", dpi = 300)
+
+ggsave2("Figure4Jbottom_v3.pdf", plot_grid( dome_heatmap, prim5_heatmap, early_late_meta, nrow = 1), width = 12, height = 6, units = "in", dpi = 300)
+
+
+```

@@ -1,0 +1,9 @@
+high-pec	H3K27ac	ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000651SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bam
+high-pec	H3K27ac	K27ac_48hpf.bam
+high-pec	H3K27me3	ChIP-seq_Skarmeta_Lab_H3K27me3_0002AS.DCD000630SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bam
+high-pec	H3K27me3	K27me3_48hpf.bam
+high-pec	H3K4me1		ChIP-seq_Skarmeta_Lab_H3K4me1_0002AS.DCD000650SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bam
+high-pec	H3K4me1		K4me1_48hpf.bam
+high-pec	H3K4me3		ChIP-seq_Skarmeta_Lab_H3K4me3_0002AS.DCD000640SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bam
+high-pec	H3K4me3		K4me3_48hpf.bam
+

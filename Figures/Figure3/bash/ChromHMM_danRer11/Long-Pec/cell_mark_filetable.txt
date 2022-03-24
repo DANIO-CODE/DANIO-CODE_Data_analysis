@@ -1,0 +1,8 @@
+LongPec	H3K27ac	2F_S1_R1_001.PE2SE.nodup.bam
+LongPec	H3K4me1	4F_S2_R1_001.PE2SE.nodup.bam
+LongPec	H3K27me3	6F_S3_R1_001.PE2SE.nodup.bam
+LongPec	H3K27ac		ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000651SQ.USERpanosfirbas.R1.merged.bam
+LongPec	H3K27me3	ChIP-seq_Skarmeta_Lab_H3K27me3_0002AS.DCD000630SQ.USERpanosfirbas.R1.merged.bam
+LongPec	H3K4me1		ChIP-seq_Skarmeta_Lab_H3K4me1_0002AS.DCD000650SQ.USERpanosfirbas.R1.merged.bam
+LongPec	H3K4me3		ChIP-seq_Skarmeta_Lab_H3K4me3_0002AS.DCD000640SQ.USERpanosfirbas.R1.merged.bam
+
