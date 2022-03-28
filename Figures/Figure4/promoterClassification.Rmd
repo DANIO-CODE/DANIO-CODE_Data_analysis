@@ -1,0 +1,4273 @@
+---
+title: "DanioCode promoter classification by ATAC"
+output:
+  html_notebook: default
+---
+
+```{r message=FALSE, warning=FALSE}
+
+# We need to load a specifi version of CAGEr package. 
+# CAGEr version 1.20
+.libPaths(c(
+            "/usr/local/lib/R/backports",  #this is where CAGEr 1.20 needs to be installed. possibly with dependencies like data.table 
+            "/usr/local/lib/R/site-library",
+            "/usr/lib/R/site-library",
+            "/usr/lib/R/library"))
+library(CAGEr)
+### end CAGEr 1.20 loading
+
+library(Hmisc)
+library(stringr)
+require(GenomicFeatures)
+# dependency: transcript database (for annotation)
+txDb <- loadDb("/mnt/biggles/csc_home/piotr/Work/BbsrcGeneral/TxDb/txDb.ucsc.danRer10.sqlite")
+library( "biomaRt" )
+mart <- useEnsembl(biomart = "ensembl", 
+                   dataset = "drerio_gene_ensembl", 
+                   version = "91")
+library(dplyr)
+library(BSgenome.Drerio.UCSC.danRer10)
+library(genomation)
+library(purrr)
+library(furrr)
+plan(multisession, workers=8)
+options(future.globals.maxSize= 10*1024^3)
+# dependency: scripts
+source("MyLibs/pngByPdf.R")
+source("MyLibs/pioGO.R")
+source("MyLibs/safeEcdf.R")
+library(plyranges)
+library(tidyr)
+library(vioplot)
+options(dplyr.summarise.inform=F)
+library(TFBSTools)
+library(openxlsx)
+library(riverplot)
+```
+
+
+Dependencies:
+```{r}
+# dependency: dominant TSSs at tagging_Prim5 sample.
+dominantTssR <- readRDS("../AnalysisUnmerged/dominantTss.tagging_Prim5.RDS") %>% GRanges(seqinfo=seqinfo(Drerio))
+prom800R <- dominantTssR %>% resize(800, "start") %>% resize(1600, "end") %>%
+    {.[trim(.) == .]} # 23368 promoter regions
+
+
+tc <- list()
+# dependency: transcription clusters in tagging_Prim5 sample
+tc$tagging_Prim5 <- readRDS("../AnalysisUnmerged/tc.tagging_Prim5.RDS")
+
+# dependency: cageSet from promoterome construction
+cs.canon <- readRDS("../AnalysisUnmerged/cs.canon.RDS")
+
+# dependency: list of k-means clustering. index signifies the number of clusters.
+kmL <- readRDS("../ExpressionClustering/kmL.RDS")
+
+# dependency: 27781 consensus clusters with k-means information and 5x5 som (expression) clustering
+consClusKm <- readRDS("../ExpressionClustering/concCluKm.RDS")
+```
+
+
+```{r}
+ensTx <- transcriptsBy(txDb, "gene") %>% unlist()  %>% sort() %>% {.$ensGene <- names(.); .}
+ensTss <- promoters(ensTx, 0, 1, use.names=T)
+
+# annoatation with genes and transcripts:
+addnotateTranscripts <- function(x)
+{
+    d <- distanceToNearest(x, ensTss, ignore.strand=FALSE) %>%
+        as_tibble() %>%
+        mutate(ensT = ensTss[subjectHits]$tx_name, tcI=queryHits) %>%
+        mutate(ensG = ensTss[subjectHits]$ensGene) %>%
+        dplyr::filter(distance <= 1000)
+    
+    x$EnsTx <- NA_character_
+    x$EnsTxDist <- NA_integer_
+    x$EnsTxI <- NA_integer_
+    x$EnsG <- NA_character_
+    
+    x$EnsTx[d$tcI] <- d$ensT
+    x$EnsTxDist[d$tcI] <- d$distance
+    x$EnsTxI[d$tcI] <- d$subjectHits
+    x$EnsG[d$tcI] <- d$ensG
+    
+    x
+}
+
+addnotateTranscripts(tc$tagging_Prim5)
+```
+
+construct prom800R2: promoter -800bp to 800bp regions around domiant TSS. 
+Regions are used for the heatmap construction
+
+```{r}
+{
+    prom800R2 <- tc$tagging_Prim5
+    seqlevels(prom800R2) <- seqlevels(Drerio)
+    seqinfo(prom800R2) <- seqinfo(Drerio)
+    
+    ranges(prom800R2) <- IRanges(start=tc$tagging_Prim5$dominant_ctss, width=1)
+    goodI <- prom800R2 %>% resize(800, "start") %>% resize(1600, "end") %>%
+    {
+        trim(.) == .
+    }
+    prom800R.actualTc <- prom800R2[goodI]   # contains off chromosome regions WHEN EXTENDED
+    prom800R2 <- prom800R2 %>% resize(800, "start") %>% resize(1600, "end") %>%
+    {
+        .[goodI]
+    }
+    (prom800R2 != prom800R) %>% sum()  # returns zero correctly
+}
+
+saveRDS(prom800R2, "prom800R2.RDS")
+```
+
+
+
+Annotate consensus clusters with genes and gene ontologies:
+```{r}
+consClusKm <- addnotateTranscripts(consClusKm)
+consClusKm$GO <- getgo(genes=consClusKm$EnsG %>% str_split("\\.") %>% map(`[`, 1) %>% reduce(c), 
+      genome="danRer10", 
+      id="ensGene")
+
+ourGenes <- consClusKm$EnsG %>% unique() %>% na.omit() %>% str_split("\\.") %>% map(`[`, 1) %>% reduce(c)
+allGenes <- ensTx$ensGene %>% unique() %>% na.omit() %>% str_split("\\.") %>% map(`[`, 1) %>% reduce(c)
+ourGenes %>% length()
+allGenes %>% length()
+missedGO <- pioGO(thisGenes=setdiff(allGenes, ourGenes), 
+      allGenes=allGenes,
+      txDb=txDb, 
+      genome="danRer10")
+ensG2GO <- getgo(genes=allGenes, 
+      genome="danRer10", 
+      id="ensGene")
+
+```
+
+
+
+```{r}
+dc <- list()
+
+#dependency: bigWig files with ATAC cut sites extended -5 to +5 bp:
+dc$F = c(
+		"/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/ATAC-seq_Skarmeta_Lab_0001AS.DCD000395SQ.USERpanosfirbas.R1.PE2SE.cuts.ext10.bw",
+		"/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/ATAC-seq_Skarmeta_Lab_0001AS.DCD000395SQ.USERpanosfirbas.R1.PE2SE.nodup.cuts.ext10.bw",
+		"/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/ATAC-seq_Skarmeta_Lab_0001AS.DCD000394SQ.USERpanosfirbas.R1.trim.PE2SE.cuts.ext10.bw",
+		"/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/ATAC-seq_Skarmeta_Lab_0001AS.DCD000394SQ.USERpanosfirbas.R1.trim.PE2SE.nodup.cuts.ext10.bw"
+	)
+dc$N = c(
+	"prim5.r1",
+	"prim5.r1.nodup",
+	"prim5.r2",
+	"prim5.r2.nodup"
+	)
+names(dc$F) = dc$N
+
+sm.dc <- map(dc$F, function(f)
+{
+	ScoreMatrixBin(windows=prom800R, target=f, strand.aware=TRUE, bin.num = 160)  # 1600 into 160 bins
+})
+
+sm.tn5.prim5.r2 <- ScoreMatrix(windows=prom800R2,
+                        target="/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/ATAC-seq_Skarmeta_Lab_0001AS.DCD000394SQ.USERpanosfirbas.R1.trim.PE2SE.cuts.ext10.bw",
+                               strand.aware=TRUE)
+
+#### saveRDS(object = sm.dc$prim5.r1, file = "sm.dc_prim5.r1.RDS")
+```
+
+
+```{r}
+dir.create("Plots2020")
+map2(sm.dc, names(sm.dc), function(m, i)
+{
+	pdf(paste0("Plots2020/sm.dc.17.", i, ".pdf"))
+	km <- kmeans(m@.Data, iter.max = 80, centers = 17)
+	o <- apply(km$centers, 1, cumsum) %>% `[`(50, ) %>% order(decreasing = T) %>% order()
+	oc <- order(o[km$cluster])
+	m@.Data <- m@.Data[oc, ]    #[km$clustero[seq_along(m@.Data[,1])], ]
+	#m@.Data[1:10, 1:10]
+#	image(t(m@.Data[1:50, ]))
+	heatMatrix(m, xcoords = c(-800,800), winsorize = c(0, 95), 
+	           clustfun = function(i) sort(o[km$cluster]))  # fake clustering function to force heatMatrix to 
+	dev.off()
+})
+
+map2(sm.dc, names(sm.dc), function(m, i)
+{
+	pdf(paste0("Plots2020/sm.dc.5.", i, ".pdf"))
+	km <- kmeans(m@.Data, iter.max = 80, centers = 5)
+	o <- apply(km$centers, 1, cumsum) %>% `[`(50, ) %>% order(decreasing = T) %>% order()
+	oc <- order(o[km$cluster])
+	m@.Data <- m@.Data[oc, ]    #[km$clustero[seq_along(m@.Data[,1])], ]
+	#m@.Data[1:10, 1:10]
+#	image(t(m@.Data[1:50, ]))
+	heatMatrix(m, xcoords = c(-800,800), winsorize = c(0, 95), clustfun = function(i) sort(o[km$cluster]))  # fake clustering function to force heatMatrix to 
+	dev.off()
+})
+
+
+```
+
+# CAGE profiles at these clusters:
+```{r}
+set.seed(4991)
+km.17.prim5.r1 <- kmeans(sm.dc$prim5.r1@.Data, iter.max = 80, centers = 17)
+set.seed(4991)
+km.5.prim5.r1  <- kmeans(sm.dc$prim5.r1@.Data, iter.max = 80, centers = 5)
+set.seed(4991)
+km.5.prim5.r2  <- kmeans(sm.dc$prim5.r2@.Data, iter.max = 80, centers = 5)
+set.seed(4991)
+km.8.prim5.r2  <- kmeans(sm.dc$prim5.r2@.Data, iter.max = 200, centers = 8)
+set.seed(4991)
+km.10.prim5.r2  <- kmeans(sm.dc$prim5.r2@.Data, iter.max = 200, centers = 10)
+set.seed(4991)
+km.12.prim5.r2  <- kmeans(sm.dc$prim5.r2@.Data, iter.max = 200, centers = 12)
+set.seed(4991)
+km.17.prim5.r2 <- kmeans(sm.dc$prim5.r2@.Data, iter.max = 80, centers = 17)
+
+
+```
+
+
+
+Genomation BUG: if a particular chromosome does not have any signal (and no seqnames in its index) then genomation warns and skips regions from this chr:
+Found from error message: 'which' contains seqnames not known to BigWig file: chrUn_KN150109v1levels in 'seqnames' with no entries in 'seqinfo' were dropped
+
+```{r}
+# bugI <- 23212
+# foo <- ScoreMatrix("../AnalysisUnmerged/cs.noBad.pulled.+.bw", 
+#                    windows=prom800R[setdiff(1:length(prom800R), bugI)], 
+#                    strand.aware=T)
+# # this one works well:
+# bar <- ScoreMatrix("../AnalysisUnmerged/cs.noBad.pulled.-.bw", windows=prom800R, strand.aware=T)
+# 
+# # init empty ScoreMatrix
+# cageSm <- new("ScoreMatrix", matrix(0, length(prom800R), 1600))
+# # fill it with data for plust strand:
+# cageSm@.Data[setdiff(1:length(prom800R), bugI), ] <- foo@.Data
+# # fill it with data for minus strand:
+# dn <- attr(bar, "dimnames")[[1]] %>% as.integer()   # prom indices present in bar;
+# assignRI <- (strand(prom800R[dn]) == "-") %>% as.logical()
+# assignLI <- ((strand(prom800R) == "-") %>% as.logical()) & (1:length(prom800R) %in% dn)  # left index
+
+# cageSm@.Data[assignLI] <- bar@.Data[assignRI]
+```
+
+
+
+fixes genomation bug; puts zeros in unaccounted rows
+input c(plus.bw, minus.bw), proms
+
+```{r}
+ScoreMatrixFromTwoBigWigsSafe <- function(plusMinusBws, windows, negateMinusStrand = TRUE)
+{
+    require("genomation")
+    stopifnot(min(width(windows)) == max(width(windows)))
+    ret <- new("ScoreMatrix", matrix(0, length(windows), width(windows)[1]))
+    # fill it with data for plus strand:
+    strands <- c("+", "-");
+    bw <- list(import.bw(plusMinusBws[1]) %>% fixSeqinfo(),
+               import.bw(plusMinusBws[2]) %>% fixSeqinfo())
+    
+    for(i in 1:2)
+    {
+        str <- strands[i]
+        bar <- ScoreMatrix(bw[[i]], windows=windows, strand.aware=T)
+        dn <- attr(bar, "dimnames")[[1]] %>% as.integer()   # prom indices present in bar;
+        assignRI <- ( strand(windows[dn]) == str) %>% as.logical()
+        assignLI <- ((strand(windows)     == str) %>% as.logical()) &
+            (1:length(windows) %in% dn)  # left index
+        if(str == "-" && negateMinusStrand)
+            bar@.Data <- -bar@.Data
+        ret@.Data[assignLI, ] <- bar@.Data[assignRI, ]
+    }
+    ret
+}
+
+# dependency: bigwig files with pooled CAGE separate for + and - strands:
+cageSmNoLog <- ScoreMatrixFromTwoBigWigsSafe(c("../AnalysisUnmerged/cs.noBad.pooled.+.bw",
+                                               "../AnalysisUnmerged/cs.noBad.pooled.-.bw"),
+                                             prom800R, negateMinusStrand=F)
+cageSm <- cageSmNoLog
+cageSm@.Data <- log10(1+cageSm@.Data)
+heatMatrix(cageSm, xcoords=c(-800, 800), winsorize=c(0,98))
+#pngByPdf("heatm.png", pdfFileName="heatm.pdf",
+#         code=heatMatrix(cageSm, xcoords=c(-800, 800)),
+#         resolutionDpi=300, )
+#
+cageSmNegNoLog <- ScoreMatrixFromTwoBigWigsSafe(c("../AnalysisUnmerged/cs.noBad.pulled.-.bw",  # reverse order of files
+                                           "../AnalysisUnmerged/cs.noBad.pulled.+.bw"),
+                                         prom800R, negateMinusStrand=F)
+cageSmNeg <- cageSmNegNoLog
+cageSmNeg@.Data <- log10(1+cageSmNeg@.Data)
+
+
+# dependency: bigwig files with pooled CAGE from post-MBT samples, separate for + and - strands:
+sm.cagePostMbtFwNoLog <- ScoreMatrixFromTwoBigWigsSafe(
+    c("../AnalysisUnmerged/tss.postMbt.canon.+.bw",
+      "../AnalysisUnmerged/tss.postMbt.canon.-.bw"),
+    prom800R2, negateMinusStrand=F)
+
+sm.cagePostMbtRevNoLog <- ScoreMatrixFromTwoBigWigsSafe(
+    c("../AnalysisUnmerged/tss.postMbt.canon.-.bw",
+      "../AnalysisUnmerged/tss.postMbt.canon.+.bw"),
+    prom800R2, negateMinusStrand=F)
+
+sm.cagePostMbtFwLog <- log10(1+sm.cagePostMbtFwNoLog)
+sm.cagePostMbtRevLog <- log10(1+sm.cagePostMbtRevNoLog)
+
+pngByPdf("heatmaptPostMbtCage.png", pdfFileName="heatm.pdf",
+         code=heatMatrix(sm.cagePostMbtFwLog, xcoords=c(-800, 800), winsorize=c(0,98)),
+         resolutionDpi=300)
+```
+
+(That fix worked.)
+
+k-means to cluster function:
+
+```{r}
+km2clus <- function(km, prom=prom800R2, names=NULL)
+{
+    ret <- tibble(clus=km$cluster, promI=1:length(prom)) %>%
+        group_by(clus) %>%
+        summarise(clus=list(promI)) %>%
+        `$`("clus")
+    if(!is.null(names))
+        names(ret) <- names
+    ret
+}
+
+clus.5.prim5.r2 <- km2clus(km.5.prim5.r2)
+clus.8.prim5.r2 <- km2clus(km.8.prim5.r2)
+clus.10.prim5.r2 <- km2clus(km.10.prim5.r2)
+clus.12.prim5.r2 <- km2clus(km.12.prim5.r2)
+clus.17.prim5.r2 <- km2clus(km.17.prim5.r2)
+
+clus.17.prim5.r1 <- km2clus(km.17.prim5.r1)
+clus.5.prim5.r1 <- km2clus(km.5.prim5.r1)
+
+# export:
+clus.17.prim5.r1 %>% map(~prom800R.actualTc[.]) %>% saveRDS("atac.clusters.prim5.r1.17.RDS")
+clus.17.prim5.r2 %>% map(~prom800R.actualTc[.]) %>% saveRDS("atac.clusters.prim5.r2.17.RDS")
+clus.5.prim5.r1  %>% map(~prom800R.actualTc[.]) %>% saveRDS("atac.clusters.prim5.r1.5.RDS")
+prom800R %>% export.bed("prom800R.bed")
+
+
+#plot(x=c(0, 1600), y=range(cageSm@.Data), type="n")
+clus.17.prim5.r1 %>% map(~cageSm[., ]) %>% map(~colMeans(.)) %>% 
+    map(~plot(-800:799, ., type="l", ylab="", xlab=""))
+
+```
+
+
+```{r}
+clus.17.prim5.r1 %>% map(~sm.dc$prim5.r1[., ]) %>% map(~colMeans(.)) %>%
+    map(~plot(-80:79, ., type="l", ylab="", xlab=""))
+```
+
+Plot CAGE from both strands:
+```{r}
+clus.17.prim5.r1 %>% map(~
+{
+    atac <- sm.dc$prim5.r1[., ] %>% colMeans
+    cage <- cageSm[., ] %>% colMeans
+    cageRev <- cageSmNeg[., ] %>% colMeans
+    par(mar = c(5, 4, 4, 4) + 0.3)
+    plot(-800:799, cage, type="l", ylab="mean log10 TSS usage",
+         xlab="genomic position wrt strongest TSS", ylim=c(0, 2.5),)
+    
+    lines(-800:799, cageRev, col="blue")
+    
+    par(new = TRUE)
+    plot(seq(-800+5, 799, by=10), atac, type = "l", ylim=c(0, 1.5),
+         axes = FALSE, bty = "n", xlab = "", ylab = "", col="red")
+    axis(side=4, at = pretty(c(0, 1.5)), col.ticks="red", )
+    mtext("mean ATAC", side=4, line=3, col="red")
+})
+    
+    
+```
+
+Try the same for 5 classes:
+```{r}
+clus.5.prim5.r1 %>% map(~
+{
+    atac <- sm.dc$prim5.r1[., ] %>% colMeans
+    cage <- cageSm[., ] %>% colMeans
+    cageRev <- cageSmNeg[., ] %>% colMeans
+    par(mar = c(5, 4, 4, 4) + 0.3)
+    plot(-800:799, cage, type="l", ylab="mean log10 TSS usage",
+         xlab="genomic position wrt strongest TSS", ylim=c(0, 2.5),)
+    
+    lines(-800:799, cageRev, col="blue")
+    
+    par(new = TRUE)
+    plot(seq(-800+5, 799, by=10), atac, type = "l", ylim=c(0, 1.5),
+         axes = FALSE, bty = "n", xlab = "", ylab = "", col="red")
+    axis(side=4, at = pretty(c(0, 1.5)), col.ticks="red", )
+    mtext("mean ATAC", side=4, line=3, col="red")
+})
+
+```
+
+
+order promoter regions by iq width 
+```{r}
+prom800R2 %>% as_tibble() %>% mutate(iqw = q_0.9 - q_0.1) %>% `[[`("iqw") %>% table() %>%
+    {pngByPdf("iq_width.tagging_prim5.png", resolutionDpi=300, code=plot(., main="iq width"))}
+```
+
+
+```{r}
+order(prom800R2$q_0.9 - prom800R2$q_0.1)
+
+pdf("heatMat.CAGE.IQorder.pdf")
+heatMatrix(cageSm, xcoords = c(-800,800), winsorize = c(0, 95),
+           clustfun = function(i) (prom800R2$q_0.9 - prom800R2$q_0.1))
+abline(v=0.3967)
+dev.off()
+
+pdf("heatMat.ATAC.IQorder.pdf")
+heatMatrix(sm.dc$prim5.r1, xcoords = c(-800,800), winsorize = c(0, 95),
+           clustfun = function(i) (prom800R2$q_0.9 - prom800R2$q_0.1)) 
+abline(v=0.3967) # this is the centre
+dev.off()
+
+```
+
+```{r}
+(prom800R2$q_0.9 - prom800R2$q_0.1) %>%
+    {tibble(iqw = if_else((. < 54),
+                       ., (as.integer(./5)*5)),
+        i = 1:length(prom800R))} %>%
+    group_by(iqw) %>% summarise(ind = list(i)) %>% 
+    {
+        ret=.[["ind"]]
+        names(ret) = .[["iqw"]] %>% as.character()
+        ret
+    } %>%
+    map(~sm.dc$prim5.r1[., ]) %>%
+    map(colMeans) %>% head(60) %>% 
+    #imap(function(x, n)
+    #{
+    #    x + as.integer(n)
+    #}) %>%
+    do.call(what=cbind) %>% 
+    {
+        image(.)
+        matplot(x=seq(-795, 799, by=10), y=., type="l",)
+    }
+
+```
+
+
+TSS usage and ATAC across 17 classes.
+
+```{r}
+clus.17.prim5.r2 %>% map(~
+{
+    atac <- sm.dc$prim5.r2[., ] %>% colMeans
+    cage <- cageSm[., ] %>% colMeans
+    cageRev <- cageSmNeg[., ] %>% colMeans
+    par(mar = c(5, 4, 4, 4) + 0.3)
+    plot(-800:799, cage, type="l", ylab="mean log10 TSS usage",
+         xlab="genomic position wrt strongest TSS", ylim=c(0, 2.5),)
+    
+    lines(-800:799, cageRev, col="blue")
+    
+    par(new = TRUE)
+    plot(seq(-800+5, 799, by=10), atac, type = "l", ylim=c(0, 3),
+         axes = FALSE, bty = "n", xlab = "", ylab = "", col="red")
+    axis(side=4, at = pretty(c(0, 3)), col.ticks="red", )
+    mtext("mean ATAC", side=4, line=3, col="red")
+}) %>% invisible()
+    
+    
+```
+
+Let's try to find centre of mass of CAGE 
+Note May 2021: we decided not to follow this approach
+```{r}
+#100-100 or 200-200 extension left and right to get CAGE:
+
+# 23368 #promoters in classes and the score  matrix dim:
+
+centreOfMassShift <- cageSmNoLogPostMbt[, (800-100):(800+100)] %>% #100bp from centre (800)
+    apply(1, function(r)
+    {
+        ret <- round(((r * (1:201)) %>% sum()) / sum(r))
+        ret - 101
+    }) 
+centreOfMassShift %>%
+    hist(201, main="shift from dominant CTSS to CAGE centre of mass", xlab="shift, #bases downstream")
+```
+Save it as new anchors.
+Shift ATAC by this number
+(not possible because ATAC is binned and shifts dont follow bining)
+```{r}
+sm.dc$prim5.r2 %>% apply(1, list) %>% head(2)
+```
+
+```{r}
+prom800R.centreOfCage <- GenomicRanges::shift(prom800R2, shift=ifelse(strand(prom800R2) == "+", centreOfMassShift, -centreOfMassShift))
+sm.dc.centreOfCage <- map(dc$F, function(f)
+{
+	ScoreMatrixBin(windows=prom800R.centreOfCage, target=f, strand.aware=TRUE, bin.num = 160)  # 1600 into 160 bins
+})
+saveRDS(object = sm.dc.centreOfCage$prim5.r2, file = "sm.dc.centreOfCage.prim5.r2.RDS")
+
+set.seed(4991)
+km.c17.prim5.r2 <- kmeans(sm.dc.centreOfCage$prim5.r2@.Data, iter.max = 80, centers = 17)
+clus.c17.prim5.r2 <- tibble(clus=km.c17.prim5.r2$cluster, promI=1:length(prom800R.centreOfCage)) %>%
+    group_by(clus) %>% summarise(clus=list(promI)) %>% `$`("clus")
+
+pngByPdf("Plots2020/sm.dc.c17.prim5.r2.png", code=
+{
+	o <- apply(km.c17.prim5.r2$centers, 1, cumsum) %>% `[`(50, ) %>% order(decreasing = T) %>% order()
+	oc <- order(o[km.c17.prim5.r2$cluster])
+	heatMatrix(sm.dc.centreOfCage$prim5.r2[oc, ], xcoords = c(-800,800), winsorize = c(0, 99), 
+	           clustfun = function(i) sort(o[km.c17.prim5.r2$cluster]))  # fake clustering function to force heatMatrix to 
+}, resolutionDpi=300, pdfFileName="Plots2020/sm.dc.c17.prim5.r2.pdf")
+
+# and the old one for comparison:
+
+pngByPdf("Plots2020/sm.dc.17.prim5.r2.png", code=
+{
+	#o <- apply(km.17.prim5.r2$centers, 1, cumsum) %>% `[`(50, ) %>% order(decreasing = T) %>% order()
+	#oc <- order(o[km.17.prim5.r2$cluster])
+	#heatMatrix(sm.dc$prim5.r2[oc, ], xcoords = c(-800,800), winsorize = c(0, 99), 
+	#           clustfun = function(i) sort(o[km.17.prim5.r2$cluster]))  # fake clustering function to force heatMatrix to 
+	heatMatrix(sm.dc$prim5.r2, xcoords = c(-800,800), winsorize = c(0, 99), 
+	           clustfun = function(i) km.17.prim5.r2$cluster)
+}, resolutionDpi=300, pdfFileName="Plots2020/sm.dc.17.prim5.r2_.pdf")
+
+dir.create("KmeansTestingDaniocode.centreOfCage/")
+# execute: sbatch -a 1-40 -J kmeans -o KmeansTestingDaniocode.centreOfCage/slurm-%J.out --mem 5G submit_kmeans_daniocode.R
+```
+
+```{r}
+aic_bic_d.coc = list()
+for(i in 1:40)
+{
+	tmp = read.table(paste0("KmeansTestingDaniocode.centreOfCage/", i))
+	tmp[, "V1"] = NULL
+	aic_bic_d.coc[[i]] = tmp
+	tmp[,1] = i
+}
+aic_bic_d.coc = do.call(rbind, aic_bic_d.coc)
+plot(1:40, aic_bic_d.coc[,1], type='l', xlim=c(2,40), 
+     ylim = c(min(aic_bic_d.coc[2:40,1]), max(aic_bic_d.coc[2:40,2])), 
+     col="red", xlab="number of clusters", 
+	 ylab="", lwd=2, 
+     main=paste0("Clustering open chromatin\nMinimums AIC:", 
+                 which.min(aic_bic_d.coc[,1]), " BIC:", which.min(aic_bic_d.coc[,2])),
+	 log="")
+lines(aic_bic_d.coc[,2], type='l', lwd=2)
+grid()
+legend("topright", legend=c("AIC", "BIC"), col=c("red", "black"), lwd=2) 
+```
+
+
+
+```{r}
+set.seed(4991)
+km.c12.prim5.r2   <- kmeans(sm.dc.centreOfCage$prim5.r2@.Data, iter.max = 100, centers = 12)
+clus.c12.prim5.r2 <- tibble(clus=km.c12.prim5.r2$cluster, promI=1:length(prom800R.centreOfCage)) %>%
+    group_by(clus) %>% summarise(clus=list(promI)) %>% `$`("clus")
+
+pngByPdf("Plots2020/sm.dc.c12.prim5.r2.png", code=
+{
+	#o <- apply(km.c12.prim5.r2$centers, 1, cumsum) %>% `[`(50, ) %>% order(decreasing = T) %>% order()
+	#oc <- order(o[km.c12.prim5.r2$cluster])
+	heatMatrix(sm.dc.centreOfCage$prim5.r2[, ], xcoords = c(-800,800), winsorize = c(0, 99), 
+	           clustfun = function(i) km.c12.prim5.r2$cluster)  # fake clustering function to force heatMatrix to 
+    #c(4, 5, 11, 8, 2, 7, 6, 9, 12, 1, 3, 10)
+    #c(10, 5, 11, 1, 2, 7, 6, 4, 8, 12, 3, 9)
+}, resolutionDpi=300, pdfFileName="Plots2020/sm.dc.c12.prim5.r2.pdf")
+
+```
+
+"coc" stands for Centre of CAGE
+```{r}
+cageSmNoLogPostMbt.coc <- ScoreMatrixFromTwoBigWigsSafe(c("../AnalysisUnmerged/tss.postMbt.canon.+.bw",
+                                          "../AnalysisUnmerged/tss.postMbt.canon.-.bw"),
+                                        prom800R.centreOfCage, negateMinusStrand=TRUE)
+cageSmPostMbt.coc <- cageSmNoLogPostMbt.coc
+cageSmPostMbt.coc@.Data <- log10(1+cageSmPostMbt.coc@.Data)
+
+cageSmNegNoLogPostMbt.coc <- ScoreMatrixFromTwoBigWigsSafe(c("../AnalysisUnmerged/tss.postMbt.canon.-.bw",
+                                          "../AnalysisUnmerged/tss.postMbt.canon.+.bw"),
+                                        prom800R.centreOfCage, negateMinusStrand=TRUE)
+cageSmNegPostMbt.coc <- cageSmNegNoLogPostMbt.coc
+cageSmNegPostMbt.coc@.Data <- log10(1-cageSmNegPostMbt.coc@.Data)
+
+```
+
+
+```{r}
+clus.c12.prim5.r2 %>% map(~
+{
+    atac <- sm.dc.centreOfCage$prim5.r2[., ] %>% colMeans
+    cage <- cageSmPostMbt.coc[., ] %>% colMeans
+    cageRev <- cageSmNegPostMbt.coc[., ] %>% colMeans
+    par(mar = c(5, 4, 4, 4) + 0.3)
+    plot(-800:799, cage, type="l", ylab="mean log10 TSS usage",
+         xlab="genomic position wrt promoter centre", ylim=c(0, 0.8),)
+    
+    lines(-800:799, cageRev, col="blue")
+    
+    par(new = TRUE)
+    plot(seq(-800+5, 799, by=10), atac, type = "l", ylim=c(0, 3),
+         axes = FALSE, bty = "n", xlab = "", ylab = "", col="red")
+    axis(side=4, at = pretty(c(0, 3)), col.ticks="red", )
+    mtext("mean ATAC", side=4, line=3, col="red")
+}) %>% invisible()
+    
+    
+```
+The result smooths out features...
+Better to use +1 nucleosome diad for this.
+
+1) annotate the promoterome finally
+```{r}
+distanceToNearest(tc$tagging_Prim5, ensTss, ignore.strand=FALSE) %>% as_tibble() %>%
+    `[[`("distance") %>% 
+    {Ecdf(.+1, log="x", what="f", ylab="num EnsTss closer than d", xlab="d: distance [bp]",
+          main="cumulative distribution of EnsTss distance from prim5 TCs")} %>% {abline(v=1000); abline(v=500)}
+```
+
+
+```{r}
+
+
+go.17.prim5.r2 <- clus.17.prim5.r2 %>% map(function(k)
+{
+    prom800R2[k] %>% `$`("EnsG") %>% na.omit() %>% 
+        stringr::str_split_fixed("\\.", 2) %>%
+        as.data.frame() %>%
+        {.[, 1]} %>%
+        unique() %>%
+        pioGO(allGenes=allGenes)
+})
+
+go.17.prim5.r2 %>% map(~
+{
+    .[1:10, c("bh_adj_over_represented_pvalue", "ontology", "term", "numDEInCat", "numInCat")] %>%
+        rename(adjPval = bh_adj_over_represented_pvalue) %>%
+        dplyr::filter(adjPval < 0.01)
+})
+
+
+```
+
+
+```{r}
+clus.5.prim5.r1 %>% map(~
+{
+    atac <- sm.dc$prim5.r1[., ] %>% colMeans
+    cage <- cageSm[., ] %>% colMeans
+    cageRev <- cageSmNeg[., ] %>% colMeans
+    par(mar = c(5, 4, 4, 4) + 0.3)
+    plot(-800:799, cage, type="l", ylab="mean log10 TSS usage",
+         xlab="genomic position wrt strongest TSS", ylim=c(0, 2.5),)
+    
+    lines(-800:799, cageRev, col="blue")
+    
+    par(new = TRUE)
+    plot(seq(-800+5, 799, by=10), atac, type = "l", ylim=c(0, 1.5),
+         axes = FALSE, bty = "n", xlab = "", ylab = "", col="red")
+    axis(side=4, at = pretty(c(0, 1.5)), col.ticks="red", )
+    mtext("mean ATAC", side=4, line=3, col="red")
+})
+    
+    
+```
+
+
+
+```{r}
+go.5.prim5.r1 <- clus.5.prim5.r1 %>% map(function(k)
+{
+    prom800R2[k] %>% `$`("EnsG") %>% na.omit() %>% 
+        stringr::str_split_fixed("\\.", 2) %>%
+        as.data.frame() %>%
+        {.[, 1]} %>%
+        unique() %>%
+        pioGO(allGenes=allGenes)
+})
+
+go.5.prim5.r1 %>% map(~
+{
+    .[1:10, c("bh_adj_over_represented_pvalue", "ontology", "term", "numDEInCat", "numInCat")] %>%
+        rename(adjPval = bh_adj_over_represented_pvalue) %>%
+        dplyr::filter(adjPval < 0.01)
+})
+
+clus2topGo <- function(clus, prom, genome="danRer10", txDb=txDb, nTop=10)
+{
+    stopifnot(!is.null(prom$EnsG))
+    allGenes <- prom %>% `$`("EnsG") %>% na.omit() %>% 
+        stringr::str_split_fixed("\\.", 2) %>%
+        as.data.frame() %>%
+        {.[, 1]} %>%
+        unique()
+    map(clus, function(k)
+    {
+        prom[k] %>% `$`("EnsG") %>% na.omit() %>% 
+            stringr::str_split_fixed("\\.", 2) %>%
+            as.data.frame() %>%
+            {.[, 1]} %>%
+            unique() %>%
+            pioGO(allGenes=allGenes, genome=genome, txDb=txDb) %>%
+            `[`(1:nTop, c("bh_adj_over_represented_pvalue", "ontology", 
+                          "term", "numDEInCat", "numInCat")) %>%
+            rename(adjPval = bh_adj_over_represented_pvalue) %>%
+            dplyr::filter(adjPval < 0.01)
+    })
+}
+clus2topGo(clus.5.prim5.r1, prom800R2)
+```
+
+
+```{r}
+fixSeqinfo <- function(obj)
+{
+    seqlevels(obj) <- seqlevels(BSgenome.Drerio.UCSC.danRer10::Drerio)
+    seqlengths(obj)<- seqlengths(BSgenome.Drerio.UCSC.danRer10::Drerio)
+    seqinfo(obj)   <- seqinfo  (BSgenome.Drerio.UCSC.danRer10::Drerio)
+    obj
+}
+phastFish <- import.bw("/mnt/biggles/data/PhastCons/danRer10/phastConsFish/ZF_GC_CC_GF.bw") %>%   fixSeqinfo()
+phastVert <- import.bw("/mnt/biggles/data/PhastCons/danRer10/phastCons12way/danRer10.phastCons12way.bw") %>% fixSeqinfo()
+sm.phastFish2 <- ScoreMatrix(subsetByOverlaps(phastFish, prom800R2), prom800R2, strand.aware=T, weight.col="score")
+sm.phastVert  <- ScoreMatrix(subsetByOverlaps(phastVert, prom800R2), prom800R2, strand.aware=T, weight.col="score")
+sm.k27 <- ScoreMatrix(subsetByOverlaps(k27, prom800R2), prom800R2, strand.aware=T, weight.col="score")
+
+kern.n5 <- dnorm((-15):15, mean=0, sd=5) %>% {./sum(.)}
+kern.n4 <- dnorm((-12):12, mean=0, sd=4) %>% {./sum(.)}
+kern.n3 <- dnorm((-9):9, mean=0, sd=3) %>% {./sum(.)}
+kern.n2 <- dnorm((-6):6, mean=0, sd=2) %>% {./sum(.)}
+kern.n1 <- dnorm((-3):3, mean=0, sd=1) %>% {./sum(.)}
+kern.n50 <- dnorm((-150):150, mean=0, sd=50) %>% {./sum(.)}
+kern.n30 <- dnorm((-90):90, mean=0, sd=30) %>% {./sum(.)}
+
+clus2phastCons <- function(clus, prom, sm, smoothW=0)
+{
+    if(dim(sm)[1] != length(prom))
+        stop("score matrix has wrong dimension.")
+    map(clus, function(cc)
+    {
+        sm@.Data[cc, , drop=F] %>% colMeans(na.rm=T) %>% (function(d)
+        {
+            if(length(smoothW) == 1)
+                d
+            else
+            {
+                pad <- floor(length(smoothW) / 2)
+                signal::conv(d, smoothW)[(pad+1):(length(d)+pad)]
+            }
+        })
+    })
+}
+```
+
+```{r}
+# „smooth” is an English verb below:
+smoothScoreMatrix <- function(sm, rowKern)  # column smoothing not implemented
+{
+    # could be made better by cloning leftmost and rightmost values in rows
+    pad <- floor(length(rowKern) / 2)
+    ret <- apply(sm@.Data, 1, function(r)
+        signal::conv(r, rowKern)[(pad+1):(length(r)+pad)]
+    ) %>% t()
+    sm@.Data <- ret
+    return(sm)
+}
+```
+
+
+```{r}
+sm.phastFish@.Data[1111:1115, 800:810] %>% colSums()  %>% (function(d)
+            {if(T)
+                d
+            else
+                {
+                    signal::conv(d, kern.n3)[10:(length(d)+9)]
+                }
+            })
+```
+
+```{r}
+clus2phastCons(clus.5.prim5.r1, prom800R2, sm.phastFish) %>% do.call(what=cbind) %>% matplot(type="l")
+clus2phastCons(clus.17.prim5.r2, prom800R2, sm.phastFish) %>% do.call(what=cbind) %>% matplot(type="l")
+clus2phastCons(clus.c12.prim5.r2, prom800R2, sm.phastFish) %>% do.call(what=cbind) %>% matplot(type="l")
+```
+```{r}
+atacPgc <- import.bw("/mnt/piotrcluster/Piotr/Tracks/Ext10/ATAC.PGC_24hpf.rep1.Fabio.2017-03.danRer10.cuts.ext10.bw") %>% fixSeqinfo()
+atacSoma <- import.bw("/mnt/piotrcluster/Piotr/Tracks/Ext10/ATAC.somatic_24hpf.rep1.Fabio.2017-03.danRer10.cuts.ext10.bw") %>% fixSeqinfo()
+atacBrain <- import.bw("/mnt/piotrcluster/Piotr/Tracks/Ext10/ATAC.brain.rep2.Fabio.2017-03.danRer10.cuts.ext10.bw") %>% fixSeqinfo()
+k4Sperm <- import.bw("/mnt/biggles/csc_home/piotr/Work/ChIP_bbsrc/Tracks/Coverage/H3K4me3.sperm.rep1.BBSRC.2017-10.danRer10.peSpan.bw") %>% fixSeqinfo()
+meth.jiaGermring <- import.bw("./Jia_germring___danRer10_sorted_deduplicated_filter_CpG.bigwig") %>% fixSeqinfo()
+atacPrim5.r2.hires <- import.bw("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/ATAC-seq_Skarmeta_Lab_0001AS.DCD000394SQ.USERpanosfirbas.R1.trim.PE2SE.cuts.ext2.bw") %>% fixSeqinfo()
+
+sm.atacPgc <- ScoreMatrix(atacPgc, prom800R2, strand.aware=T, weight.col="score",)
+sm.atacSoma <- ScoreMatrix(atacSoma, prom800R2, strand.aware=T, weight.col="score",)
+sm.atacBrain <- ScoreMatrix(atacBrain, prom800R2, strand.aware=T, weight.col="score",)
+sm.k4Sperm <- ScoreMatrix(k4Sperm, prom800R2, strand.aware=T, weight.col="score",)
+sm.methJiaGermring <- ScoreMatrix(meth.jiaGermring, prom800R2, strand.aware=T, weight.col="score",)
+sm.atacPrim5.r2.hires <- ScoreMatrix(atacPrim5.r2.hires, prom800R2, strand.aware=T, weight.col="score",)  # not really hires because of the bigwig binning!!
+sm.atac9Somit2 <- ScoreMatrix(atac9Somit2,  prom800R2, strand.aware=T, weight.col="score" )
+sm.atacDomeMerg <- ScoreMatrix(atacDomeMerg,  prom800R2, strand.aware=T, weight.col="score")
+sm.atacDomeMert.2.1 <- ScoreMatrix(atacDomeMerg.2.1, prom800R2, strand.aware=T, weight.col="score")
+sm.atac9somit.2.1 <- ScoreMatrix(atac9Somit.2.1, prom800R2, strand.aware=T, weight.col="score")
+
+
+atac75pEpi.2.1  <- import.bw("/mnt/storage/Piotr/ATAC_bbsrc/Tracks/CutSites/75pEpi.cuts.ext2.binSize1.bw") %>%
+    fixSeqinfo()
+atacShield.2.1  <- import.bw("/mnt/storage/Piotr/ATAC_bbsrc/Tracks/CutSites/shield.cuts.ext2.binSize1.bw") %>%
+    fixSeqinfo()
+atacLongPec.2.1 <- import.bw("/mnt/storage/Piotr/ATAC_bbsrc/Tracks/CutSites/longPec.cuts.ext2.binSize1.bw") %>%
+    fixSeqinfo()
+atacOblong.2.1 <- import.bw("/mnt/storage/Piotr/ATAC_bbsrc/Tracks/CutSites/oblong-DCD003161SQ.cuts.ext2.binSize1.bw") %>%
+    fixSeqinfo()
+
+sm.atac75pEpi.2.1 <- ScoreMatrix(
+    target=atac75pEpi.2.1, 
+    windows=prom800R2, 
+    strand.aware=T, 
+    weight.col="score")
+sm.atacShield.2.1 <- ScoreMatrix(
+    target=atacShield.2.1, 
+    windows=prom800R2, 
+    strand.aware=T, 
+    weight.col="score")
+sm.atacLongPec.2.1 <- ScoreMatrix(
+    target=atacLongPec.2.1, 
+    windows=prom800R2, 
+    strand.aware=T, 
+    weight.col="score")
+sm.oblong.2.1 <- ScoreMatrix(
+    target=atacOblong.2.1, 
+    windows=prom800R2, 
+    strand.aware=T, 
+    weight.col="score")
+
+
+```
+
+
+```{r}
+clus2phastCons(clus.5.prim5.r1, prom800R2, sm.atacPgc) %>% do.call(what=cbind) %>% matplot(type="l")
+clus2phastCons(clus.5.prim5.r1, prom800R2, sm.atacSoma) %>% do.call(what=cbind) %>% matplot(type="l")
+clus2phastCons(clus.5.prim5.r1, prom800R2, sm.atacBrain) %>% do.call(what=cbind) %>% matplot(type="l")
+clus2phastCons(clus.5.prim5.r1, prom800R2, sm.k4Sperm) %>% do.call(what=cbind) %>% matplot(type="l")
+clus2phastCons(clus.5.prim5.r1, prom800R2, sm.methJiaGermring, smoothW=1) %>% do.call(what=cbind) %>% #`[`(700:900, ) %>% 
+    matplot(type="l")
+
+clus2phastCons(clus.17.prim5.r2, prom800R2, sm.atacPgc) %>% do.call(what=cbind) %>% matplot(type="l")
+clus2phastCons(clus.17.prim5.r2, prom800R2, sm.atacSoma) %>% do.call(what=cbind) %>% matplot(type="l")
+clus2phastCons(clus.17.prim5.r2, prom800R2, sm.atacBrain) %>% do.call(what=cbind) %>% matplot(type="l")
+clus2phastCons(clus.17.prim5.r2, prom800R2, sm.k4Sperm) %>% do.call(what=cbind) %>% matplot(type="l")
+clus2phastCons(clus.17.prim5.r2, prom800R2, sm.methJiaGermring, smoothW=1) %>% do.call(what=cbind) %>% matplot(type="l")
+
+clus2phastCons(clus.c12.prim5.r2, prom800R2, sm.atacPgc) %>% do.call(what=cbind) %>% matplot(type="l")
+clus2phastCons(clus.c12.prim5.r2, prom800R2, sm.atacSoma) %>% do.call(what=cbind) %>% matplot(type="l")
+clus2phastCons(clus.c12.prim5.r2, prom800R2, sm.atacBrain) %>% do.call(what=cbind) %>% matplot(type="l")
+clus2phastCons(clus.c12.prim5.r2, prom800R2, sm.k4Sperm) %>% do.call(what=cbind) %>% matplot(type="l")
+clus2phastCons(clus.c12.prim5.r2, prom800R2, sm.methJiaGermring, smoothW=1) %>% do.call(what=cbind) %>% matplot(type="l")
+
+```
+
+
+
+
+G4s:
+
+```{r}
+g4 <- import.bw("/mnt/biggles/csc_home/piotr/Work/G4Quadruplexes/g4.danRer10.bw") %>% fixSeqinfo()
+sm.g4.score <- ScoreMatrix(g4, prom800R2, strand.aware=T, weight.col="score")
+sm.g4.overlap <- ScoreMatrix(g4, prom800R2, strand.aware=T)
+clus2phastCons(clus.5.prim5.r1, prom800R2, sm.g4.score) %>% do.call(what=cbind) %>% matplot(type="l")
+clus2phastCons(clus.5.prim5.r1, prom800R2, sm.g4.overlap, smoothW=kern.n2) %>% do.call(what=cbind) %>% matplot(type="l")
+
+```
+
+ GC content and WW+ stretches
+
+```{r fig.height=6, fig.width=12}
+#getSeq(Drerio, prom800R2[1:2]) %>% as.character() %>% base::strsplit(split="[GC]") %>% map(~paste0(., collapse=" "))
+#getSeq(Drerio, prom800R2[1:2]) %>% as.character() %>% base::strsplit(split="[GC]") %>%  #%>% map(~paste0(., collapse=" ")) %>% map(nchar)
+#    map(nchar) %>% map(~Rle(values=(.>0), lengths=ifelse(.==0, 1, .))) %>% map(as.numeric)
+
+sm.gc <- getSeq(Drerio, prom800R2) %>% 
+    as.character() %>% 
+    base::strsplit("") %>% 
+    map(~.%in% c("G", "C")) %>% 
+    map(as.numeric) %>% 
+    do.call(what="rbind")
+
+sm.wwPlus <- getSeq(Drerio, prom800R2) %>% 
+    as.character() %>% 
+    base::strsplit("") %>% 
+    map(~.%in% c("A", "T")) %>% 
+    map(~as(.,"Rle")) %>% map(function(r)
+    {
+        runValue(r) <- ifelse(runLength(r) >= 2 & runValue(r) == T, TRUE, FALSE)
+        r %>% as.numeric()
+    }) %>%
+    do.call(what="rbind")
+
+sm.wwwwwPlus <- getSeq(Drerio, prom800R2) %>% 
+    as.character() %>% 
+    base::strsplit("") %>% 
+    map(~.%in% c("A", "T")) %>% 
+    map(~as(.,"Rle")) %>% map(function(r)
+    {
+        runValue(r) <- ifelse(runLength(r) >= 5 & runValue(r) == T, TRUE, FALSE)
+        r %>% as.numeric()
+    }) %>%
+    do.call(what="rbind")
+
+sm.TATAWAWR <- getSeq(Drerio, prom800R2) %>% 
+    as.character() %>% 
+    str_locate_all("TATA[AT]A[AT][AG]") %>%
+    map(function(match)
+    {
+        ret <- rep(0.0, 1600)
+        for( i in seq_along(match[ , 1, drop=T]))
+            ret[match[i, "start"] : match[i, "end"]] <- 1
+        ret
+    }) %>% do.call(what="rbind")
+
+
+
+clus2phastCons(clus.5.prim5.r1, prom800R2, sm.gc, smoothW=kern.n2) %>% do.call(what=cbind) %>% matplot(type="l", lty=1)
+clus2phastCons(clus.5.prim5.r1, prom800R2, sm.wwPlus, smoothW=0) %>% do.call(what=cbind) %>% matplot(type="l", lty=1)
+
+```
+Nucleosome positions:
+```{r fig.height=5, fig.width=12}
+nucPos <- import.bed("/mnt/piotrcluster/DanioCodeCage/HMMATAC/0001AS.DCD000394SQ.nucleoatac.nucpos.bed3") %>% fixSeqinfo()
+sm.nucPos <- ScoreMatrix(nucPos, prom800R2, strand.aware=T)
+clus2phastCons(clus.5.prim5.r1, prom800R2, sm.nucPos, smoothW=kern.n2) %>% do.call(what=cbind) %>% matplot(type="l")
+
+```
+
+ctcf positions:
+```{r}
+ctcf <- import("/mnt/piotrcluster/Piotr/SitePredictions/CTCFresults.intscore.bed") %>% fixSeqinfo()
+sm.ctcf <- ScoreMatrix(ctcf, prom800R2, strand.aware=T, weight.col="score")
+clus2phastCons(clus.5.prim5.r1, prom800R2, sm.ctcf, smoothW=kern.n2) %>% do.call(what=cbind) %>% 
+    matplot(type="l") %>% 
+    {legend("topright", legend=1:5, lty = 1:5, lwd = 1, col = 1:6)}
+
+```
+
+```{r}
+cds <- cds(txDb) %>% GenomicRanges::reduce()
+sm.cds <- ScoreMatrix(cds, prom800R2, strand.aware=T)
+sm.cdsStart <- ScoreMatrix(cds(txDb) %>% promoters(0, 1) , prom800R2, strand.aware=T)
+
+introns <- intronsByTranscript(txDb) %>% unlist() %>% GenomicRanges::reduce()
+sm.intron <- ScoreMatrix(introns, prom800R2, strand.aware=T)
+```
+
+
+```{r}
+# dependency: bigWig files of ATAC cut sites:
+
+atacDome.DCD003084SQ.small <- import.bw("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/ATAC-seq_Skarmeta_Lab_0002AS.DCD003084SQ.USERmickael.dong.R1.merged.filt.cuts.ext10.smallFile78kAln.bw") %>% fixSeqinfo()
+sm.atacDome.DCD003084SQ.small <- ScoreMatrix(atacDome.DCD003084SQ.small, prom800R2, strand.aware=T, weight.col="score")
+
+atac9Somit <- import.bw("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/9somites.cuts.ext10.bw") %>% fixSeqinfo()
+
+atac9Somit2 <- import.bw("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/9somites.cuts.ext2.bw") %>% fixSeqinfo()
+
+atacDomeMerg <- import.bw("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/dome.cuts.ext10.bw") %>% fixSeqinfo()
+
+atacDomeMerg.2.1 <- import.bw("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/dome.cuts.ext2.binSize1.bw") %>% fixSeqinfo()
+
+atac9Somit.2.1 <- import.bw("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/9somites.cuts.ext2.binSize1.bw") %>% fixSeqinfo()
+
+# dependency: GRB target genes
+grbTarget <- import.bed("/mnt/biggles/csc_home/piotr/Work/BbsrcGeneral/GRB_targets_zebrafish/targetsDanRer10.bed2") %>% fixSeqinfo()
+sm.grbTarget <- ScoreMatrix(grbTarget, prom800R2, strand.aware=T)
+
+```
+
+DNA shape
+```{r}
+library(DNAshapeR)
+names(prom800R2) <- as.character(prom800R2)
+getFasta(GR=prom800R2, BSgenome=Drerio, width=1600, filename="prom800R2.DNAshaperR.fasta") #very strange package. Talks to itself via filesystem
+dnaShape <- getShape("prom800R2.DNAshaperR.fasta")
+```
+
+GO
+```{r}
+suppressMessages(clus2topGo(clus.5.prim5.r1, prom800R2))
+capture.output(clus2topGo(clus.5.prim5.r1, prom800R2), file="/dev/null")
+
+```
+
+General function to plot multiple aggregated profiles at promoter
+```{r fig.height=7, fig.width=14}
+plotMultiAggr <- function(plottingConf, clus, prom=prom800R2, trimEdgesBp=10, 
+                          zeroAt=800, zeroDesc="zygotic dominant TSS", classNames=NULL,
+                          outF=NULL, width=7, height=7)
+{
+    pmap(plottingConf, function(sm, kern, main)
+    {
+        xWid <- dim(sm)[2]
+        if(! is.null(outF))
+            svg(paste0(outF, '.', main, '.svg'), width = width, height = height)
+        clus2phastCons(clus, prom, sm, smoothW=kern) %>% 
+            do.call(what=cbind) %>% 
+            `[`((1+trimEdgesBp):(xWid-trimEdgesBp), ) %>%
+            matplot(x=(1-zeroAt+trimEdgesBp):(xWid-trimEdgesBp-zeroAt),
+                    type="l", main=main, ylab="", 
+                    xlab=zeroDesc, axes=F, lwd=1.5, col=1:8, lty=rep(1:3, each=8))
+        axis(1, at=seq(-800, 800, 100), col.axis="black", las=2)
+        axis(2)
+        abline(v=seq(-800, 800, 100), col="lightgray", lty="dotted", lwd=1)
+        abline(v=0, col="gray")
+        legend("topright", 
+               legend=if(is.null(classNames)) 1:length(clus) else classNames,
+               col=1:8, lty=rep(1:3, each=8), lwd = 1.5)
+        if(! is.null(outF))
+            dev.off()
+    }) %>% invisible()
+
+}
+```
+
+
+```{r fig.height=7, fig.width=14}
+plotMultiAggr(plottingConf= list(
+    list(sm.tn5.prim5.r2,
+         sm.atacPrim5.r2.hires,
+         sm.atacDome.DCD003084SQ.small,
+         sm.ctcf,
+         sm.nucPos,
+         sm.gc,     # 1
+         sm.wwPlus,
+         sm.wwwwwPlus,
+         sm.TATAWAWR,
+         sm.phastFish2,
+         sm.phastVert,
+         sm.g4.overlap,  #2
+         sm.g4.score,
+         sm.atacPgc,
+         sm.atacSoma,
+         sm.atacBrain,
+         sm.k4Sperm,    #3
+         sm.methJiaGermring,
+         sm.cagePostMbtFwLog,
+         sm.cagePostMbtRevLog,
+         sm.cds,
+         sm.cdsStart, #4
+         sm.intron,
+         sm.grbTarget,
+         dnaShape$MGW,
+         dnaShape$ProT,
+         dnaShape$EP, #5
+         dnaShape$HelT,
+         dnaShape$Roll),
+    list(0, 0, 0, kern.n2, kern.n2, kern.n2,  #1
+         kern.n2, kern.n2, kern.n1, kern.n2, kern.n2, kern.n2,  #2
+         kern.n2, 0, 0, 0, 0,  #3
+         kern.n3, kern.n1, kern.n2, 0, kern.n5, #4 
+         0, kern.n5, kern.n1, kern.n1, kern.n2, #5
+         kern.n2, kern.n2),
+    list("ATAC Prim5 (mean Tn5 cut profile)",
+         "ATAC Prim5, high resulution",
+         "ATAC dome (DCD003084SQ.small)",
+         "CTCF PWM score",
+         "nucleosome Dyad predictions",
+         "GC content",
+         "WW+ stretches (at least 2 W)",
+         "WWWWW+ stretches (at least 5 W)",
+         "TATAWAWR stretches",
+         "phastCons scores, fish minus tetrapods",
+         "phastCons scores, 12 vertebrates (Burgess)", 
+         "G4, positions",
+         "G4, Pol2 stalling scores (strandless)",
+         "ATAC Soma (mean Tn5 cut profile)",
+         "ATAC PGC (mean Tn5 cut profile)",
+         "ATAC brain (mean Tn5 cut profile)",
+         "H3K4me3 in sperm (coverage)",
+         "density of (un-)methylated CpGs, Germring (scale [-1, 1])",
+         "CAGE post-MBT, forward",
+         "CAGE post-MBT, reverse",
+         "CDS coverage of EnsTx",
+         "CDS starts of EnsTx",
+         "intron coverage (any intron in any EnsTx)",
+         "GRB target promoter percentage",
+         "DNA minor groove width prediction",
+         "DNA propeller twist prediction",
+         "DNA electrostatic potential prediction",
+         "DNA helix twist",
+         "DNA roll")
+    ), clus.5.prim5.r2)    
+        
+```
+
+
+
+Save session:
+```{r}
+rm("atacBrain", "atacPgc", "atacSoma", "k4Sperm", "meth.jiaGermring")
+save.image()
+```
+
+Now dyad position at the +1 (aka 0) nucleosome.
+
+```{r}
+sm.nucPos[, (800):(800+180)] %>% colSums() %>% plot(type="h")
+```
+
+
+```{r fig.height=5, fig.width=8}
+
+
+# due to how nucleoatac works there can be more than one nuclesosome prediction
+#  in the span of 180 (I am using the "nucleoatac.nucpos.bed" file):
+sm.nucPos[, (800):(800+180)] %>% apply(., 1, function(r)
+{
+    which(r > 0) %>% length()
+}) %>% hist()
+
+# one way to obtain:
+dyadShift <- sm.nucPos[, (800):(800+180)] %>% apply(., 1, function(r)
+{
+    suppressWarnings(min(which(r > 0)) - 1)  #lots of warnings
+    
+})
+# there will be Inf in places where there is no nucleosome detected.
+dyadShift %>% {.[is.finite(.)]} %>%
+    table() %>% {
+        p <- par(mar=c(4.1,4.1,5.1,1.1))
+        plot(names(.) %>% as.integer(), as.vector(.), type="h",
+             main=paste0("Global picture of distance from the dominant CTSS\nto the first nucleosome dyad downstream.\n\n",
+                         sum(.), " out of ", length(prom800R2), " (", format(100 *sum(.) /  length(prom800R2)),
+                         "%) promoters\nhave a nucleosome prediction in 180bp."),
+             xlab="shift, #bases downstream",
+             ylab="#promoters having a muc dyad",
+             cex.main=1)
+        par(p)
+        }
+
+```
+
+
+```{r fig.height=5, fig.width=12}
+hasDyad <- is.finite(dyadShift)
+prom800R2.dyad <- prom800R2[hasDyad, ]
+tunePromoters <- function(sm, by, whenInf="remove", cutBy=max(by[is.finite(by)]) )
+{
+    xdim <- dim(sm)[2]
+    ret <- sm[is.finite(by), ]
+    by <- by[is.finite(by)]
+    ret %>% as("matrix") %>% t() %>% as.data.frame() %>% as.list() %>%
+        map2(., by, function(v, s)
+            v[(s+1):(s+xdim-cutBy)]
+        ) %>% do.call(what=rbind)
+} 
+sm.nucPos.ns <- tunePromoters(sm.nucPos, by=dyadShift, cutBy=199)
+#microbenchmark(sm.nucpos.ns <- tunePromoters(sm.nucPos[1:5410, ], by=dyadShift[1:5410]-1), times=1 )
+sm.nucPos.ns %>% colSums() %>% `[<-`(800, 0) %>% plot(x=(-800):600, y=., type="h")
+
+```
+
+```{r fig.height=5, fig.width=12}
+set.seed(4991)
+kN.5.prim5.r2 <- kmeans(x=tunePromoters(sm.atacPrim5.r2.hires, by=dyadShift, cutBy=199),
+                         iter.max = 80, centers = 5)
+clusN.5.prim5.r2 <- km2clus(kN.5.prim5.r2, prom=prom800R2.dyad)
+set.seed(4991)
+kN.8.prim5.r2 <- kmeans(x=tunePromoters(sm.atacPrim5.r2.hires, by=dyadShift, cutBy=199),
+                         iter.max = 80, centers = 8)
+clusN.8.prim5.r2 <- km2clus(kN.8.prim5.r2, prom=prom800R2.dyad)
+```
+
+
+```{r fig.height=5, fig.width=12}
+list(
+    list(sm.atacPrim5.r2.hires, 0, "ATAC 24hpf r2; used for clustering"),
+    list(sm.cagePostMbtFwLog, kern.n1, "post-MBT CAGE"),
+    list(sm.cagePostMbtRevLog, kern.n1, "post-MBT CAGE reverse orientation"),
+    #list(sm.nucPos, by=dyadShift, cutBy=199) %>% {.[, 800] <- 0; .}, kern.n2, "other nucleosome positions"),
+    list(sm.wwPlus, kern.n1, "WW+"),
+    list(sm.grbTarget, 0, "GRB target percentage"),
+    list(sm.phastFish2, 0, "Phast cons fish"),
+    list(sm.TATAWAWR, 0, "TATAWAWR"),
+    list(sm.gc, 0, "GC content"),
+    #list(sm.methJiaGermring, kern.n2, "methylation"),
+    list(sm.cagePostMbtFwNoLog, kern.n2, "post-MBT CAGE (nolog)"),
+    list(sm.ctcf, kern.n2, "CTCF"),
+    #list(sm.g4.overlap, kern.n2, "G4 overlap"),
+    list(sm.gc, 0, "GC content")
+    #list(sm.k27, 0, "K27me3 at 30pE")
+    ) %>% do.call(what=rbind) %>% 
+    apply(2, identity) %>%
+    {
+        .[[1]] <- map(.[[1]], function(sm)
+            tunePromoters(sm, by=dyadShift, cutBy=199))
+        .
+    } %>%
+    plotMultiAggr(plottingConf=.,
+                  clus=clusN.8.prim5.r2,
+                  prom=prom800R2.dyad,
+                  trimEdgesBp=0,
+                  zeroAt=800,
+                  zeroDesc="+1 (aka 0) nucleosome dyad"
+    )
+```
+
+
+```{r}
+# shifted, unique (best candidate)
+prom.3 <- prom800R2.dyad %>% GenomicRanges::shift(shift=dyadShift[hasDyad]) %>%
+    GenomicRanges::narrow(start=1, end=1600-199)
+
+foo <- GRanges(c("A", "A", "A", "B", "A", "C", "C", "B", "B", "B"), IRanges(c(1,5,5,6,5,11,11,1,1,10), c(2,7,7,9,7,22,22,2,2,11)))
+sort(foo)
+makeUniqueGr <- function(gr)
+{
+    require(plyranges)
+    o <- order(gr)
+    oInv <- Matrix::invPerm(o)
+    a <- gr %>% sort()
+    dummy <- GRanges(seqlevels(a)[1], IRanges(1,1))
+    r <- (c(dummy, a) == c(a, dummy)) %>% #[1:length(a)]
+        as("Rle")
+    nGroups <- sum(runValue(r))
+    #cat(nGroups);cat("\n")
+    s <- r
+    runValue(s)[runValue(r)]  <- 1:nGroups
+
+    runLength(s)[runValue(r) ] <- runLength(r)[runValue(r) == TRUE]+1
+    runLength(s)[!runValue(r)] <- runLength(r)[runValue(r) == FALSE]-1
+    
+    s <- as(s, "vector")
+    #cat(sum(!s));cat("\n")
+    s[s==0] <- (nGroups+1):(nGroups+sum(!s))
+    #runValue(s)[!runValue(r)] <- (nGroups+1):(nGroups+sum(!r))
+    
+    #return(s)
+ 
+    #if(runValue(r) %>% tail(1) == FALSE)
+    #{
+    #    runLength(s)[runLength(r) %>% length()] <- runLength(s)[runLength(r) %>% length()] + 1
+    #}
+
+    # permute^-1
+    s <- s[oInv]
+    gr$tmp1 <- 1:length(gr)
+    gr$tmp2 <- s
+    
+    # gr has now these two columns
+    
+    ret <- gr %>% group_by(tmp2) %>%    # plyranges need to be loaded
+        summarise(tmp1) %>%             # grouping of indices with the same region duplicated
+        `$`("tmp1") %>%
+        as("list") %>%
+        map(~gr[.]) %>%             # the output is a list of granges. each with
+        map(function(g)
+        {
+           # choose some criterion: needs a gene associated and strongest TSS
+            "tpm.dominant_ctss"
+            "tpm"
+            "EnsG"
+            if(!all(is.na(g$EnsG)))
+            {
+                g <- g[!all(is.na(g$EnsG))]
+            }
+            g <- g[which.max(g$tpm)]
+            g
+        }) %>% do.call(what=c)
+    
+    ret$tmp1 <- NULL
+    ret$tmp2 <- NULL
+    return(ret)
+}
+(foo)
+makeUniqueGr(foo)
+
+promWNucUniq <-  makeUniqueGr(prom.3)
+prom.4 <- prom800R2[prom800R2$cluster %in% promWNucUniq$cluster]
+
+```
+
+remove repeated promoters (sharing the same +1 nuc, and less than 180bp away from each other)
+```{r fig.height=5, fig.width=12}
+prom.3$cluster %in% promWNucUniq$cluster %>% sum()
+#16028
+promWNucUniq$cluster %in% prom.3$cluster %>% sum()
+#16028
+promWNucUniq$cluster %in% prom.3$cluster %>% sum()
+promWNucUniq$cluster %in% prom800R2$cluster %>% sum()
+#16028
+# this was just a sanity check
+# Index of representants per promoter group. indexes prom800R2 thus existing SMs as well
+reprPromI <- (prom800R2$cluster %in% promWNucUniq$cluster)
+dyadShift[reprPromI] # now it is by construction all finite :)
+
+sm.atacPrim5.r2.hires[reprPromI, ] %>% tunePromoters(by=dyadShift[reprPromI], cutBy=199) %>% as("ScoreMatrix") %>% {heatMatrix(., winsorize=c(0,98)); colSums(.) %>% plot(type='h') }
+
+set.seed(4991)
+km.nuc5.prim5.r2 <- sm.atacPrim5.r2.hires[reprPromI, ] %>% 
+    tunePromoters(by=dyadShift[reprPromI], cutBy=199) %>%
+    kmeans(centers=5, iter.max=120, nstart=20)
+clus.nuc5.prim5.r2 <- km2clus(km.nuc5.prim5.r2, prom=prom.4)
+```
+
+
+```{r fig.height=5, fig.width=12}
+list(
+    list(sm.atacPrim5.r2.hires, 0, "ATAC 24hpf r2; used for clustering"),
+    list(sm.atacDome.DCD003084SQ.small, 0, "ATAC Dome DCD003084SQ"),
+    list(sm.cagePostMbtFwLog, kern.n1, "post-MBT CAGE"),
+    list(sm.cagePostMbtRevLog, kern.n1, "post-MBT CAGE reverse orientation"),
+    #list(sm.nucPos, by=dyadShift, cutBy=199) %>% {.[, 800] <- 0; .}, kern.n2, "other nucleosome positions"),
+    list(sm.wwPlus, kern.n1, "WW+"),
+    list(sm.grbTarget, 0, "GRB target percentage"),
+    list(sm.phastFish2, 0, "Phast cons fish"),
+    list(sm.TATAWAWR, 0, "TATAWAWR"),
+    list(sm.gc, kern.n2, "GC content"),
+    #list(sm.methJiaGermring, kern.n2, "methylation"),
+    list(sm.cagePostMbtFwNoLog, kern.n1, "post-MBT CAGE (nolog)"),
+    list(sm.ctcf, kern.n2, "CTCF"),
+    #list(sm.g4.overlap, kern.n2, "G4 overlap"),
+    list(dnaShape$MGW, 0, "DNA Minor Groove Width"),
+    list(dnaShape$ProT, 0, "DNA proT"),
+    list(dnaShape$EP, 0, "DNA electrostatic potential"),
+    list(dnaShape$HelT, 0, "DNA helix twist"),
+    list(dnaShape$Roll, 0, "DNA roll")
+    ) %>% do.call(what=rbind) %>% 
+    apply(2, identity) %>%
+    {
+        .[[1]] <- map(.[[1]], function(sm)
+            tunePromoters(sm[reprPromI, ], by=dyadShift[reprPromI], cutBy=199))
+        .
+    } %>%
+    plotMultiAggr(plottingConf=.,
+                  clus=clus.nuc8.prim5.r2,
+                  prom=prom.4,
+                  trimEdgesBp=0,
+                  zeroAt=800,
+                  zeroDesc="+1 (aka 0) nucleosome dyad"
+    )
+
+```
+It worked but not much change after the removal of duplicated regions.
+GO
+```{r}
+clus2topGo(clus.nuc5.prim5.r2, prom.4)
+```
+
+
+```{r}
+set.seed(4991)
+km.nuc8.prim5.r2 <- sm.atacPrim5.r2.hires[reprPromI, ] %>% 
+    tunePromoters(by=dyadShift[reprPromI], cutBy=199) %>%
+    kmeans(centers=8, iter.max=120, nstart=20)
+clus.nuc8.prim5.r2 <- km2clus(km.nuc8.prim5.r2, prom=prom.4)
+clus2topGo(clus.nuc8.prim5.r2, prom.4)
+```
+
+
+```{r fig.height=7, fig.width=7}
+clus.nuc5.prim5.r2 %>% map(~prom.4[.]) %>% map(~with(., q_0.9 - q_0.1 + 1)) %>% `names<-`(.,1:5) %>% safeEcdf(xlab="iq width [bp]", ylab="", main="", what="1-F", log="x", col=1:5, lwd=2, xlim=c(3, 100), )
+legend("topright", lwd=2, col=1:5, legend=1:5)
+
+
+```
+
+rescale the profiles
+```{r}
+sm.atacPrim5.r2.hires %>% as("matrix")  %>% t() %>% as.data.frame() %>% map(function(p)
+    {
+        sum(p)
+    }) %>% do.call(what=c) %>% hist(200)
+```
+
+scaling:
+```{r}
+sm.atacPrim5.r2.hires[reprPromI, ] %>% 
+    tunePromoters(by=dyadShift[reprPromI], cutBy=199) %>%
+    as("matrix") %>% t() %>% as.data.frame() %>% map(function(p)
+    {
+        p/sum(p)
+    }) %>% do.call(what=rbind) %>% #as("ScoreMatrix") %>% genomation::heatMatrix(winsorize=c(0,98))
+    km.nuc5.prim5.r2 <- sm.atacPrim5.r2.hires[reprPromI, ] %>% 
+    tunePromoters(by=dyadShift[reprPromI], cutBy=199) %>%
+    kmeans(centers=5, iter.max=120, nstart=20)
+clus.nuc5.prim5.r2 <- km2clus(km.nuc5.prim5.r2, prom=promWNucUniq)
+
+```
+
+
+
+```{r}
+pdf("Plots2020/atacPrim5.r2.ofUniqueDyadRegions.nolog.pdf")
+sm.atacPrim5.r2.hires[reprPromI, ] %>% 
+    tunePromoters(by=dyadShift[reprPromI], cutBy=199) %>%
+    as("ScoreMatrix") %>% genomation::heatMatrix(winsorize=c(0,98))
+dev.off()
+
+prom.4 %>% as_tibble() %>% mutate(ind=seq_along(prom.4)) %>% group_by(seqnames) %>% summarise(l=list(ind)) %>% `$`("l")
+
+
+sm.atacPrim5.r2.hires[reprPromI, ] %>% 
+    tunePromoters(by=dyadShift[reprPromI], cutBy=199) %>%
+    
+
+
+```
+
+
+```{r fig.height=19, fig.width=2}
+runValue(seqnames(prom.4 ))
+runLength(seqnames(prom.4 )) %>% matrix(ncol=1) %>%  barplot(beside=F, col=c("white", "gray"))
+```
+
+```{r}
+pdf("Plots2020/cagePostMbtFwLog.ofUniqueDyadRegions.pdf")
+sm.cagePostMbtFwLog[reprPromI, ] %>% 
+    tunePromoters(by=dyadShift[reprPromI], cutBy=199) %>%
+    as("ScoreMatrix") %>% genomation::heatMatrix(winsorize=c(0,99.5))
+dev.off()
+```
+```{r}
+pdf("Plots2020/gc.ofUniqueDyadRegions.pdf")
+sm.gc[reprPromI, ] %>% 
+    tunePromoters(by=dyadShift[reprPromI], cutBy=199) %>%
+    as("ScoreMatrix") %>% genomation::heatMatrix()
+dev.off()
+```
+```{r}
+pdf("Plots2020/wwPlus.ofUniqueDyadRegions.pdf")
+sm.wwPlus[reprPromI, ] %>% 
+    tunePromoters(by=dyadShift[reprPromI], cutBy=199) %>%
+    km.nuc5.prim5.r2$cluster %>% head() %>% map(~((1:5) %in% .) %>% as.numeric() %>% rep(each=2))
+dev.off()
+```
+
+pseudo scorematrix of class nuc5 membership:
+```{r}
+sm.clusnum.nuc5.prim5.r2 <- km.nuc5.prim5.r2$cluster %>% map(function(r)
+{
+    (1:5) %in% r %>%
+        as.numeric() %>%
+        rep(each=280) %>%
+        c(1)
+}) %>% do.call(what=rbind)
+
+```
+
+```{r}
+pdf("Plots2020/clusNum.ofUniqueDyadRegions.pdf")
+sm.clusnum.nuc5.prim5.r2 %>% as("ScoreMatrix") %>% genomation::heatMatrix(col=c("white", "black"))
+dev.off()
+```
+
+```{r}
+list(
+    list(sm.atacPrim5.r2.hires, 0, "ATAC 24hpf r2; used for clustering"),
+    list(sm.cagePostMbtFwLog, kern.n1, "post-MBT CAGE"),
+    list(sm.cagePostMbtRevLog, kern.n1, "post-MBT CAGE reverse orientation"),
+    #list(sm.nucPos, by=dyadShift, cutBy=199) %>% {.[, 800] <- 0; .}, kern.n2, "other nucleosome positions"),
+    list(sm.wwPlus, kern.n1, "WW+"),
+    list(sm.grbTarget, 0, "GRB target percentage"),
+    list(sm.phastFish2, 0, "Phast cons fish"),
+    list(sm.TATAWAWR, 0, "TATAWAWR"),
+    list(sm.gc, kern.n2, "GC content"),
+    #list(sm.methJiaGermring, kern.n2, "methylation"),
+    list(sm.cagePostMbtFwNoLog, kern.n2, "post-MBT CAGE (nolog)"),
+    list(sm.ctcf, kern.n2, "CTCF")
+    #list(sm.g4.overlap, kern.n2, "G4 overlap")
+    ) %>% do.call(what=rbind) %>% 
+    apply(2, identity) %>%
+    {
+        .[[1]] <- map(.[[1]], function(sm)
+            tunePromoters(sm, by=centreOfMassShift, cutBy=199))
+        .
+    } %>%
+    plotMultiAggr(plottingConf=.,
+                  clus=clus.nuc5.prim5.r2,
+                  prom=prom800R2,
+                  trimEdgesBp=0,
+                  zeroAt=800,
+                  zeroDesc="+1 (aka 0) nucleosome dyad"
+    )
+
+```
+
+
+```{r}
+prom.4.byChr <- prom.4 %>% as_tibble() %>%
+    mutate(ind=seq_along(prom.4)) %>%
+    group_by(seqnames) %>%
+    summarise(l=list(ind)) %>%
+    {r<-.$l; names(r) <-.$seqnames; r} %>%
+    `[`(1:25)
+
+pdf("foo3.pdf", width=25, height=10)
+map(prom.4.byChr, function(i)
+{
+    ret <- sm.atacPrim5.r2.hires[reprPromI, ] %>%
+        tunePromoters(by=dyadShift[reprPromI], cutBy=199) %>%
+        `[`(i, )
+    o <- order(start(prom.4[i]))   # different order than sort(granges), because ignores strand
+    ret[o, ]
+}) %>%  # this is a list of scorematrices by chromosome
+    map(~1-(1/0.7)*thr(., 0.7)) %>%
+    map(~1-.) %>% ## for malcolm
+    map(~.[, 400:1200]) %>%
+    #map(~filter2(., (matrix(kern.n1)))) %>%
+    imap(~heatmaps::Heatmap(.x,  c(-400, 400), .y)) %>%
+    split(rep(1:5, each=5)) %>%
+    map(function(grp)
+    {
+        heatmaps::plotHeatmapList(grp, color=genomation:::.jets(255), cex=0.6)
+    })
+dev.off()
+
+
+
+tunePromoters(by=dyadShift[reprPromI], cutBy=199) %>%
+
+map(as, "ScoreMatrix") %>%
+    new(Class="ScoreMatrixList") %>% 
+    multiHeatMatrix()
+# here I poorly implemeneted plotscorematrixlist
+#%>% 
+    split(rep(1:5, each=5)) %>%
+    map(function(fiver)
+    {
+        fiver %>% reduce(function(x, y)
+        {
+            m <- max(dim(x)[1], dim(y)[1])
+            if(dim(x)[1] < m)
+            {
+                x <- rbind(x, matrix(1, ncol=dim(x)[2], nrow=m-dim(x)[1]))
+            }
+            if(dim(y)[1] < m)
+            {
+                y <- rbind(y, matrix(1, ncol=dim(y)[2], nrow=m-dim(y)[1]))
+            }
+            cbind(x,y)
+        })
+    }) %>% reduce(rbind) %>%
+    as.Image() %>% t() %>% plot()
+
+```
+
+Reproduce ATAC plot on GRBs:
+```{r}
+
+jet.colors <- function (n) 
+{
+    x <- ramp(seq.int(0, 1, length.out = n))
+    if (ncol(x) == 4L) 
+        rgb(x[, 1L], x[, 2L], x[, 3L], x[, 4L], maxColorValue = 255)
+    else rgb(x[, 1L], x[, 2L], x[, 3L], maxColorValue = 255)
+}
+
+# dependency: GRBs
+grbR <- import.bed("/mnt/biggles/csc_home/piotr/Work/BbsrcGeneral/GRBs/danRer10_AstMex102_binned_kurtosis_arl_370_0.7_pc_18_kb_windows_grbs.bed", genome=seqinfo(Drerio))
+promoters(grbR, upstream=800000, downstream=800000) %>% 
+    ScoreMatrixBin(windows=., target=atacPrim5.r2.hires, bin.num=2*40, weight.col="score") %>%
+    colSums() %>% plot(type="l") #%>% walk(abline(v=4*40))
+
+promoters(grbR, upstream=800000, downstream=800000) %>% 
+    ScoreMatrixBin(windows=., target=atacPgc, bin.num=2*40, weight.col="score") %>%
+    colSums() %>% plot(type="l") #%>% walk(abline(v=4*40))
+
+promoters(grbR, upstream=800000, downstream=800000) %>% 
+    ScoreMatrixBin(windows=., target=atacSoma, bin.num=2*40, weight.col="score") %>%
+    colSums() %>% plot(type="l")# %>% walk(abline(v=4*40))
+```
+
+```{r fig.height=5, fig.width=8}
+#pdf("funnel2.pdf")
+
+bar<- list(atacDome=atacDomeMerg.2.1,
+           atacShield=atacShield.2.1,
+           atac9Somit=atac9Somit.2.1,
+           atac75pEpi=atac75pEpi.2.1,
+           atac24h = atacPrim5.r2.hires,
+           atacLongPec = atacLongPec.2.1,
+           atacPgc = atacPgc,
+           atacSoma = atacSoma) %>% 
+    imap(function(bw, .y)
+{
+    ScoreMatrixBin(target=bw,
+               windows= grbR %>%
+                   {.[order(width(.), decreasing=T)]} %>% 
+                   GenomicRanges::resize(., fix="center", width=3*width(.), use.names=T, ignore.strand=F) %>% 
+                   {.[trim(.)==.]}, 
+               bin.num=1000,
+               weight.col="score") #%>%
+    #`@`(".Data") %>%
+    #{thr(., quantile(., 0.9))} %>%     #  == wisorize
+    #apply(MARGIN=1, signal::conv, kern.n3) %>%   # gaussian smooth with sd=3 pixels
+    #t() %>%
+    #`[`(, 31:(1000-30)) %>%
+    #as("ScoreMatrix") %>%
+    #{plotMeta(mat=., xlab="", xcoords=c(-3, 3))}
+    #heatMatrix(col=gray.colors(255, 1, 0))  #winsorize=c(0,95)
+})
+#dev.off()
+
+bar %>% imap(function(a, n)
+    a@.Data %>%
+        thr(., tt = quantile(., 0.97)) %>%
+        colSums() %>%
+        signal::conv(kern.n5) %>%
+        `[`(31:(1000 - 30)) %>%
+        (function(d)
+        {
+            plot(
+                d,
+                type = "l",
+                xlab = "",
+                col = "black",
+                main = n
+            )
+            abline(v = 500)
+        }))
+
+
+```
+
+```{r fig.height=8, fig.width=9}
+bar %>% imap(function(a, n)
+    as.vector(a@.Data)
+    #heatMatrix(a, winsorize=c(0,97))
+) %>% map(`+`, 0.001) %>% safeEcdf(what="1-F", log="xy")
+```
+
+
+```{r}
+bar %>% imap(function(a, n)
+a@.Data %>% 
+    thr(., tt=quantile(., 0.97)) %>% 
+    `[`(, 333:665) %>%
+    `%*%`(-166:166) %>% as.vector() %>% hist(50, main=n))
+```
+
+
+
+
+
+```{r fig.height=7, fig.width=9}
+grbShortR <- grbR[order(width(grbR))] %>% `[`(1:(430/4))
+bar <- list(atacPrim5.r2.hires, atacPgc, atacSoma) %>% map(function(bw)
+{
+    sm <- ScoreMatrixBin(target=bw,
+                   windows= GenomicRanges::resize(fix="center", width=0.6*10^6, grbShortR),
+                   bin.num=600,
+                   weight.col="score") %>%
+        `@`(".Data") %>%
+        #{thr(., quantile(., 0.95))} %>%     #  == wisorize
+        apply(MARGIN=1, signal::conv, kern.n3) %>%   # gaussian smooth with sd=3 pixels
+        t() %>%
+        `[`(, 21:(600-20)) %>%
+        as("ScoreMatrix")
+    #heatMatrix(sm, col=gray.colors(255, 1, 0))  #winsorize=c(0,95)
+
+    #plotMeta(sm, xcoords=c(-300000, 300000),
+    #         ylim=c(0.01, 0.024), 
+    #         xlab="pos wrt GRB centre", 
+    #         ylab="ATAC in large bins")
+})
+```
+
+```{r}
+bar
+```
+
+
+
+
+```{r fig.height=5, fig.width=9}
+ScoreMatrixBin(target=cne1R, #atacPrim5.r2.hires, #promoters(txDb, upstream=1000, downstream=1000), #cds,
+               windows= grbR %>%
+                   {.[order(width(.), decreasing = T)]} %>% 
+                   {GenomicRanges::resize(., fix="center", width=3*width(.), use.names=T, ignore.strand=F)} %>% 
+                   {.[trim(.)==.]}, 
+               #bin.op="max",
+               bin.num=200#,  weight.col="score"
+               ) %>%
+    #heatMatrix(winsorize=c(0,97))
+    plotMeta()#winsorize=c(0,97), xlab="bin num")
+
+```
+Asess overlap between kmeans expression clusterings and ATAC classes:
+
+```{r}
+prom.4
+
+
+
+
+
+# which consensus cluster does prom.4 belong to?
+tc$tagging_Prim5$consensus.cluster <- findOverlaps(tc$tagging_Prim5, consClusKm) %>% {consClusKm[subjectHits(.)]$consensus.cluster}
+# rerun prom800R2 construction at the top of the script.
+stopifnot(all(prom800R2[reprPromI] == prom.4) )   # assert
+prom.4$consensus.cluster <- prom800R2[reprPromI]$consensus.cluster
+# but some prom.4 have the same consensus cluster. apparently it is a big cluster
+
+all(names(consClusKm) == consClusKm$consensus.cluster)  # true, we can use "names"
+# 
+consClusKm[prom.4$consensus.cluster %>% as.character()]   
+
+
+ret1 <- matrix(0, nrow=5, ncol=6)
+
+#save.image("2020-09-15.Rdata", compress=F)
+
+cbind.data.frame(atacC=km.nuc5.prim5.r2$cluster, exprC=consClusKm[prom.4$consensus.cluster %>% as.character()]$km.6) %>%
+    as_tibble() %>% 
+    group_by(atacC, exprC) %>% 
+    summarise(ov=length(exprC)) %>%
+    pivot_wider(names_from=exprC, values_from=ov) %>% 
+    ungroup() %>% 
+    select(-"atacC") %>%
+    as.matrix() %>%
+    { . / matrix(rowSums(.), nrow=nrow(.), ncol=ncol(.), byrow=F) }
+
+```
+
+
+```{r fig.height=5, fig.width=5}
+# encode som coords as x+y*i
+som.5.5.pc05.fullNorm <- readRDS("../ExpressionClustering/som.5.5.pc05.fullNorm.RDS")
+consClusKm$som.5.5.pc05.fullNorm <-   complex(real=som.5.5.pc05.fullNorm$visual$x, imaginary=som.5.5.pc05.fullNorm$visual$y)
+
+som.s7 <- readRDS("../ExpressionClustering/s7.RDS")
+som.s8 <- readRDS("../ExpressionClustering/s8.RDS")
+som.s9 <- readRDS("../ExpressionClustering/s9.RDS")
+consClusKm$som.s7 <- readRDS("../ExpressionClustering/s7.RDS") %>% 
+    {complex(real=.$visual$x, imaginary=.$visual$y)}
+
+consClusKm$som.s8 <- readRDS("../ExpressionClustering/s8.RDS") %>% 
+    {complex(real=.$visual$x, imaginary=.$visual$y)}
+
+consClusKm$som.s9 <- readRDS("../ExpressionClustering/s9.RDS") %>% 
+    {complex(real=.$visual$x, imaginary=.$visual$y)}
+
+
+# removed "width" column from consClusKm$width, with new bioconductor it was complaining
+# about the name. The content was equal to width(.)
+cbind.data.frame(atacC=km.nuc5.prim5.r2$cluster, exprC=consClusKm[prom.4$consensus.cluster %>% as.character()]$som.5.5.pc05.fullNorm) %>%
+    as_tibble() %>% 
+    group_by(atacC, exprC) %>% 
+    summarise(ov=length(exprC)) %>%
+    pivot_wider(names_from=exprC, values_from=ov) %>% 
+    ungroup() %>% 
+    select(-"atacC") %>%
+    as.matrix() %>%
+    `rownames<-`(paste("atacC", seq(1, dim(.)[1]))) %>%
+    { 
+        
+        #rSums <- matrix(rowSums(.), nrow=nrow(.), ncol=ncol(.), byrow=F)
+        #cSums <- matrix(colSums(.), nrow=nrow(.), ncol=ncol(.), byrow=T)
+        #sum(.)^2 / rSums / cSums
+        expected <- rowSums(.) %*% t(colSums(.)) / sum(.)
+        #ret <- 
+        . / expected
+        #rownames(ret) <- 
+        
+    } %>% t() %>% as.data.frame() -> foo
+
+foo %>%
+    map(function(l)
+    {
+        
+        ret <- matrix(l, nrow=5, ncol=5)#, dimnames=list(real(l))) #EBImage::Image(colormode='Color') #t %>% graphics::image(col=hcl.colors(256, "YlOrRd", rev = TRUE))
+        # indices (x, y) of the original som coords
+        ret[5:1, ]
+    }) -> bar
+
+bar %>% map(function(l)
+{
+    ColorRamp <- colorRampPalette(list("blue", "white", "red"))(256)
+    ColorLevels <- seq(from=-1, to=1, length=256)
+    xmin = -1
+    xmax = 1
+    ColorRamp_ex <- ColorRamp[round(1+(min(l)-xmin)*10000/(xmax-xmin)) : round( (max(l)-xmin)*10000/(xmax-xmin) )]
+    log2(l) %>%
+            {image(t(as.matrix(.)), col=ColorRamp, las=1, xlab='',ylab='',cex.axis=1, xaxt='n',yaxt='n')}
+        # in the image lowest row is x=1, y=1..5
+})
+```
+
+
+Generic function to generate such plots
+```{r}
+# km: kmeans of ATAC object, 16028
+### prom: promoters of the same length, 16028
+# som: encoded as complex coordinates of expression SOM.
+overlapAtacWithExprClasses <- 
+    function(km,
+             som=consClusKm[prom.4$consensus.cluster %>% as.character()]$som.5.5.pc05.fullNorm,
+             ColorRamp = colorRampPalette(list("blue", "white", "red"))(256), scaleMax=3,
+             overReprTextF = TRUE, plotF=FALSE, kmNames = NULL)
+{
+    somxy <- som %>% Re() %>% max() + 1    # dimension of the som, y is hardcoded to be equal to x.
+    dummyClass <- tibble(atacC=-1,
+                         exprC=complex(somxy^2, real=rep(0:(somxy-1), somxy),
+                                       imaginary=rep(0:(somxy-1), each=somxy)))
+    
+    cbind.data.frame(atacC=km$cluster,
+                     exprC=som) %>%
+        as_tibble() %>% 
+        `rbind`(dummyClass) %>%  # add a dummy class to make sure all columns will be included
+        group_by(atacC, exprC) %>% 
+        summarise(ov=length(exprC)) %>%
+        pivot_wider(names_from=exprC, values_from=ov) %>% 
+        ungroup() %>% 
+        `[`(-1, ) %>% # remove the first row which corresponds to the dummy "-1" class
+        ungroup() %>% # why again?
+        dplyr::select(-"atacC") %>% 
+        {.[is.na(.)] <- 0; .} %>%       # NA to zero
+        as.matrix() %>%
+        `rownames<-`(paste0("atacC", seq(1, dim(.)[1]))) %>%
+        { 
+            # the object that comes here is a matrix
+            # each row is one atac class
+            # there are somxy^2 columns which need to be reordered
+            expected <- rowSums(.) %*% t(colSums(.)) / sum(.)
+            fisher <- elementwiseFisherTest(.)
+            significant <- ifelse(fisher$pvals < 0.01,  "*", "")
+            significant <- ifelse(fisher$pvals < 0.001, "**", significant)
+            observed <- .
+            ll <- list(observed=observed,
+                       expected=expected, 
+                       overrepr=(observed+0.5)/(expected+0.5),
+                       pval=fisher$pvals,
+                       oddsr=fisher$oddsr,
+                       significant=significant) %>%
+                map(function(k)
+                {
+                    ret <- k %>%
+                        t() %>%
+                        as.data.frame() %>%
+                        # mapping is per each atacC class:
+                        map(matrix, nrow=somxy, ncol=somxy, byrow=F) %>% # indices (x, y) of the original som coords)    
+                        map(~.[dim(.)[1]:1, ])  # keep x, but reverse order of y. to match SOM indices
+                })
+            if(1) # plotting
+            {
+                ColorBreaks <- seq(from=-scaleMax, to=scaleMax, length=257)
+                #if(plotF)
+                #pdf("atac-expr.overlap%03d.pdf", onefile = F, width = 1, height = 1)
+                pmap(list(ll$overrepr, ll$significant, seq_along(ll$overrepr)), function(overr, s, i)
+                {
+                    if(any(overr > scaleMax))
+                        warn("clipping colours from the high end")
+                    if(any(overr < -scaleMax))
+                        warn("clipping colours from the low end")
+
+                    if(plotF)
+                        pdf(paste0("atac-expr.overlap.", kmNames[i], ".pdf"), width = 1, height = 1)
+                    par(mar=c(0,0,0,0))
+                    image(t(as.matrix(log2(overr))[somxy:1, ]),
+                          col=ColorRamp,
+                          breaks=ColorBreaks,
+                          las=1, xlab='',ylab='',cex.axis=1, xaxt='n',yaxt='n')
+                    box()
+                    
+                    # in the image lowest row is x=1, y=1..5
+                    if(overReprTextF)
+                    {
+                        map(1:somxy, function(i)
+                        {
+                            map(1:somxy, function(j)
+                            {
+                                text((j-1)/(somxy-1), 1-(i-1)/(somxy-1), 
+                                     paste0(sprintf("%0.2f", overr[i,j]), s[i,j]))
+                            })
+                        })
+                    }
+                    if(plotF)
+                        dev.off()
+                })
+                #if(plotF)
+                #dev.off()
+
+            }
+            ll
+        }
+} 
+```
+
+```{r  fig.height=2, fig.width=2}
+overlapAtacWithExprClasses(km.nuc8.dome.r2) -> wr
+map2(wr$observed, wr$expected, ~paste(.x, round(.y), sep='/') %>% matrix(5,5)) 
+map(wr$observed, sum)
+```
+
+```{r fig.height=3.7, fig.width=3.7}
+#overlapAtacWithExprClasses(km.nuc8.dome.r2, som=consClusKm[prom.4$consensus.cluster %>%
+                                          #as.character()]$som.s7)
+overlapAtacWithExprClasses(koL.dome[[8]], som=consClusKm[promDominantFlt$consensus.cluster %>%
+                                          as.character()]$som.s7)
+#overlapAtacWithExprClasses(km.nuc8.dome.r2, som=consClusKm[prom.4$consensus.cluster %>%
+#                                         as.character()]$som.s8, somxy=9)
+```
+
+
+
+A replacement function for plotting SOM with violin plots.
+Input SOM object.
+   $code has means [class, sample]
+   $data has expression [prom, sample]
+   $visual has assignments [prom, (x, y, qerror)]
+   $code.sum has number of observations per class [class, (x, y, nobs)]
+    
+    
+```{r}
+#plots a single cell
+plotcell.violin <- function(x, y, dat, code, n, sdbar=1, ylim, yadj, circlecol, h=NULL)
+{ 
+    require(plotrix)
+
+    ##  yadj <- 0.1
+    # number of observations:
+    #text(x+1/2, y+(1-yadj/2), n)   #paste("n=", n, sep="")
+    draw.circle(x+1/2, y+(0.8-yadj/2), sqrt(n)*0.003, border="gray50", col="gray80")
+    if (!is.data.frame(dat)) dat <- as.data.frame(dat)
+    ylen <- diff(ylim)
+    ## n <- nrow(dat)
+    mm <- code
+    l <- length(code)
+    if (n > 1) 
+    {
+        ##      l <- ncol(dat)
+        ##      mm <- sapply(dat, mean)
+        ss <- sapply(dat, sd)/sqrt(n)
+    }
+    else
+    {
+        ##      mm <- dat[,1]
+        ##      l <- length(mm)
+        ##      print(mm)
+        ss <- rep(0, l)
+    }
+    # plot the graph:
+    #lines(x+((1:l)-1/2)/l, y+1+(ylim[1] + mm)*(1-yadj)/ylen)
+    
+    # plot standard deviations:
+    #if (sdbar > 0 && n > 1)
+    #    ciplot(x+((1:l)-1/2)/l, y+1+(ylim[1] + mm)*(1-yadj)/ylen,
+    #           ss, n=sdbar, 1/100, ywindow=c(y, y+1-yadj))
+    
+    # plot horizontal line (at 0)
+    if(!is.null(h))
+    {
+        lines(x=c(x, x+1),
+              y=c(y+1+(ylim[1])*(1-yadj)/ylen,
+                  y+1+(ylim[1])*(1-yadj)/ylen))
+    }
+    
+    # plot violins
+    vioplot(y+1+(ylim[1] + dat)*(1-yadj)/ylen,
+            at=x+((1:l)-1/2)/l *0.9 + 0.05,
+            add=T, wex=0.05, drawRect=F,
+            col=circlecol, border=circlecol,
+            areaEqual = F, h=0.02)
+}
+```
+    
+    
+```{r}
+somgrids.violin <- function(xdim, ydim, color,
+                     yadj=0.1, hexa, ntik, ylim) {
+  if (color) color <- rainbow(ydim*xdim, start=.7, end=.1)
+  else color <- rep("gray", xdim*ydim)
+  for (i in 0:(ydim-1)) 
+  {
+    if (hexa) d <- (i %% 2)/2
+    else d <- 0
+    # line below each row:
+    lines(c(0+d,xdim+d), c(i,i))
+    for (j in 0:xdim)
+    {
+        # vertical separators
+        segments(j+d, i, j+d, i+1)
+        if (j == xdim) break
+        # title bar (for n=num)
+        #rect(j+d, i+1-yadj, j+1+d, i+1, col=color[j*ydim+i+1])
+    }
+    # top horizontal line:
+    lines(c(0+d,xdim+d), c(i+1,i+1))
+    # left and right scales:
+    #if (i %% 2 == 1) axis(2, seq(i, i+1-yadj, length=ntik), seq(ylim[1], ylim[2], length=ntik))
+    #else axis(4, seq(i, i+1-yadj, length=ntik), seq(ylim[1], ylim[2], length=ntik))
+  }
+}
+
+```
+    
+    
+```{r fig.height=9, fig.width=9}
+plot.som.violin <- function(x, ylim=c(-3, 3), color=TRUE, ntik=3, yadj=0.1,
+                            xlab="", ylab="", circlecol=NULL, h=NULL, ...) 
+{
+    if (class(x) != "som" ) stop("The funciton must apply to a som object.\n")
+    hexa <- (x$topol == "hexa")
+    if (hexa) d <- 1/2
+    else d <- 0
+    xdim <- x$xdim; ydim <- x$ydim
+    par(mar=c(0,0,0,0))
+    plot(c(0,xdim+d), c(0,ydim), xlim=c(0,xdim+d), ylim=c(0, ydim),
+         type="n", xlab=xlab, ylab=ylab, bty="n", axes=FALSE, ...)
+    #axis(1, 0:xdim, 0:xdim)
+    
+    somgrids.violin(xdim, ydim, color=color, yadj=yadj, hexa=hexa, ylim=ylim, ntik=ntik)
+    
+    for (i in 0:(ydim-1))
+    {
+        if (hexa) d <- (i %% 2)/2
+        else d <- 0
+        for (j in 0:(xdim-1)) {
+            ind <- x$visual$x==j & x$visual$y==i
+            n <- length(ind[ind])
+            plotcell.violin(j+d, i,
+                     x$data[ind, ], x$code[i*xdim + j+1,], n, h=h,
+                     sdbar=sdbar, ylim=ylim, yadj=yadj, circlecol=circlecol[i+1, j+1])
+        }
+    }
+}
+
+#plot.som.violin(som.s7, color=F, ylim=c(-12,12), yadj=-0.2, circlecol=NULL, h=NULL)
+#plot.som.violin(som.s9, color=F, ylim=c(-12,12), yadj=-0.2, circlecol=NULL, h=NULL)
+#plot.som.violin(som.s8, color=F, ylim=c(-12,12), yadj=-0.2, circlecol=NULL, h=NULL)
+```
+
+
+```{r fig.height=6, fig.width=6}
+ccol<-array(c("firebrick1", "firebrick1", "firebrick1", "firebrick3", "firebrick3", #1st columnt upwards
+              "firebrick1", "gray", "gray", "firebrick3", "firebrick3",
+              "gray", "gray", "gray", "gray", "firebrick3",
+              "dodgerblue2", "dodgerblue2", "gray", "gray", "firebrick3",
+              "dodgerblue2", "dodgerblue2", "dodgerblue2", "gray", "gray"),
+            dim=c(5,5))
+##blue as maternal, red as zygotic and purple for MZ?
+
+plot.som.violin(som.5.5.pc05.fullNorm, color=F, ylim=c(-8,8), yadj=0.0,
+                circlecol=ccol)
+#plot.som.violin(som.5.5.pc05.fullNorm, color=F, ylim=c(-7,7), yadj=0.3)
+```
+som.s7 is 5*5 som with default params of eColNorm, that is row-normalised
+"consens.meanLogTpmPlus05PerStage.canonicalEntireConsCl.df"
+which is log2 with 0.5 TPM pseudocount.
+See "exprClus.Rmd"
+    
+```{r fig.height=7, fig.width=7}
+pdf("som.s7.pdf")
+plot.som.violin(som.s7, color=F, ylim=c(-12, 4), yadj=0.0,
+                circlecol=array(c(
+                    "dodgerblue4", "dodgerblue4",   "dodgerblue4",  "sienna3",      "firebrick4", #1st column upwards
+                    "dodgerblue1", "dodgerblue1",   "gray50",         "sienna3",      "firebrick4",
+                    "dodgerblue1", "gray50",          "gray50",         "firebrick1",   "firebrick4",
+                    "dodgerblue1", "gray50",          "gray50",         "firebrick1",   "firebrick4",
+                    "gray50",        "gray50",          "gray50",         "firebrick1",   "firebrick4"),
+                    dim=c(5,5)))
+dev.off()
+```
+
+
+```{r}
+set.seed(4991)
+km.nuc8.dome.r2 <- sm.atacDome.DCD003084SQ.small[reprPromI, ] %>% 
+    tunePromoters(by=dyadShift[reprPromI], cutBy=199) %>%
+    kmeans(centers=km.nuc8.prim5.r2$centers, iter.max=120)
+clus.nuc8.dome.r2 <- km2clus(km.nuc8.dome.r2, prom=prom.4)
+clus2topGo(clus.nuc8.dome.r2, prom.4)
+```
+```{r}
+set.seed(4991)
+km.nuc8.dome.2.1 <- sm.atacDomeMert.2.1[reprPromI, ] %>% 
+    tunePromoters(by=dyadShift[reprPromI], cutBy=199) %>%
+    kmeans(centers=8, iter.max=120, nstart = 20)
+clus.nuc8.dome.2.1 <- km2clus(km.nuc8.dome.2.1, prom=prom.4)
+clus2topGo(clus.nuc8.dome.2.1, prom.4)
+```
+
+
+
+```{r}
+tibble(prim5=km.nuc8.prim5.r2$cluster, dome=km.nuc8.dome.r2$cluster, one=1) %>%
+    group_by(prim5, dome) %>% 
+    summarise(ov=length(one)) %>%
+    pivot_wider(names_from=dome, values_from=ov) %>% 
+    ungroup() %>%
+    as.matrix() %>% 
+    `[<-`(is.na(.), 0) %>%
+    `rownames<-`(.[, 1]) %>%
+    `[`( , 2:(dim(.)[2]))
+# dims: prim5, dome
+```
+
+```{r}
+umaps <- readRDS("../UmapDamir/umaps_with_regions.RDS")
+```
+
+
+```{r fig.height=5, fig.width=12}
+list(
+    list(sm.atacDome.DCD003084SQ.small, 0, "ATAC dome DCD003084SQ; used for clustering"),
+    list(sm.atacPrim5.r2.hires, 0, "ATAC 24hpf r2"),
+    list(sm.atacDomeMert.2.1, 0, "ATAC dome merged, 1bp resolution"),
+    list(sm.atac9somit.2.1,   0, "ATAC 9somites, 1bp resolutio"),
+    list(sm.cagePostMbtFwLog, kern.n1, "post-MBT CAGE"),
+    list(sm.cagePostMbtRevLog, kern.n1, "post-MBT CAGE reverse orientation"),
+    #list(sm.nucPos, by=dyadShift, cutBy=199) %>% {.[, 800] <- 0; .}, kern.n2, "other nucleosome positions"),
+    list(sm.wwPlus, kern.n1, "WW+"),
+    list(sm.grbTarget, 0, "GRB target percentage"),
+    list(sm.phastFish2, 0, "Phast cons fish"),
+    list(sm.TATAWAWR, 0, "TATAWAWR"),
+    list(sm.gc, 0, "GC content"),
+    #list(sm.methJiaGermring, kern.n2, "methylation"),
+    list(sm.cagePostMbtFwNoLog, kern.n2, "post-MBT CAGE (nolog)"),
+    list(sm.ctcf, kern.n2, "CTCF"),
+    #list(sm.g4.overlap, kern.n2, "G4 overlap"),
+    list(sm.gc, 0, "GC content"),
+    list(dnaShape$MGW, 0, "DNA Minor Groove Width"),
+    list(dnaShape$ProT, 0, "DNA proT"),
+    list(dnaShape$EP, 0, "DNA electrostatic potential"),
+    list(dnaShape$HelT, 0, "DNA helix twist"),
+    list(dnaShape$Roll, 0, "DNA roll")
+    #list(sm.k27, 0, "K27me3 at 30pE")
+    ) %>% do.call(what=rbind) %>% 
+    apply(2, identity) %>%
+    {
+        .[[1]] <- map(.[[1]], function(sm)
+            tunePromoters(sm[reprPromI, ], by=dyadShift[reprPromI], cutBy=199))
+        .
+    } %>%
+    plotMultiAggr(plottingConf=.,
+                  clus=clus.nuc8.dome.r2,
+                  prom=prom.4,
+                  trimEdgesBp=0,
+                  zeroAt=800,
+                  zeroDesc="+1 (aka 0) nucleosome dyad"
+    )
+```
+
+Add prim5 peak umap indices to prom800R2:
+```{r}
+prom800R2$umap.prim5I <- NA_integer_
+findOverlaps(umaps$prim5$peaks, prom800R.actualTc) %>% 
+    as_tibble() %>% 
+    rename(peakI=queryHits, promI=subjectHits) %>% 
+    group_by(promI) %>% 
+    summarise(peakI) -> tmp;
+prom800R2$umap.prim5I[tmp$promI] <- tmp$peakI
+# warning umap.prim5I can have repeated values (but not the other way around)    
+
+#rerun construction of prom.4 above
+```
+
+
+Let's try the other way around: producing ATAC profiles per each 5x5 som:
+```{r}
+consClusKm
+#som.5.5.pc05.fullNorm   #27781 consensus clusters
+findOverlaps(consClusKm, prom800R.actualTc)
+```
+
+
+```{r}
+som.5.5.pc05.fullNorm$visual$qerror %>% Ecdf(what="1-F", log="")
+```
+
+```{r}
+
+consClusKm$width <- width(consClusKm) ## because plyranges are maldesigned
+
+consClusKm #%>% group_by(som.5.5.pc05.fullNorm) 
+
+# choose one repr promoter per consensus cluster:
+tc$tagging_Prim5_bySom <- split(tc$tagging_Prim5, tc$tagging_Prim5$consensus.cluster) %>% 
+    #head() %>% 
+    as.list %>% 
+    map(~.[which.max(.$tpm.dominant_ctss)]) %>%
+    reduce(c) %>% 
+    `$<-`("som.5.5.pc05.fullNorm", consClusKm[as.character(.$consensus.cluster)]$som.5.5.pc05.fullNorm ) %>%
+    split(as.character(.$som.5.5.pc05.fullNorm ))
+
+```
+
+```{r}
+tc$tagging_Prim5_bySom %>% as.list %>% map(~(width(.)))
+
+# general function to plot whatever at 5x5 lattice presented as in SOM graphs.
+plot5x5 <- function(argL, plotG, ...)  # argument is list of data to be plotted together with a plotting function and its arguments
+{
+    l <- matrix(1:25, 5,5)
+    layout(l)
+    par(mar=c(1, 1, 1, 1))
+
+    for(i in seq_along(argL))
+    {
+        cat("plotting "); cat(i); cat(" ")
+        par(mar=c(1, 0, 1, 0))
+        plotG(argL[[i]], ...=...)
+    }
+}
+plot5x5()
+```
+
+
+```{r}
+foo <- tc$tagging_Prim5_bySom %>% as.list() %>% map(function(grp)
+{
+    ranges(grp) <- IRanges(grp$dominant_ctss, width=0) + 800;
+    sm <- ScoreMatrix(atacPrim5.r2.hires, grp, strand.aware=T, weight.col="score")
+    sm
+}) #%>%    plot5x5(plotMeta, winsorize=c(0,97) )
+
+```
+
+```{r fig.height=8, fig.width=9}
+plot5x5(foo, plotMeta)
+```
+
+Function to calculate "interquantile width" (defined as in CAGEr, In reality there are no quantiles, because it does not work on distributions.)
+
+```{r}
+iqw <- function(posV, exprV, q = 0.1)
+{
+    if(q >= 0.5) stop("wrong quantile value")
+    #exprV <- c(exprV, 0)
+    #posV <- c(posV, posV[length(posV)]+1)
+    s <- sum(exprV)
+    cs <- cumsum(exprV)
+    lI <- first(which(cs > q * s))
+    rI <- first(which(cs > (1 - q) * s))
+    return(posV[rI] - posV[lI] + 1)
+}
+
+iqw(1:16, rep(1, 16))
+iqw(1, 1)
+toIqw %>% map(~iqw(.[,1], .[,2], q=0.49999)) %>% unlist() %>% {which(. > 6)}
+
+```
+
+```{r}
+toIqw <- consClusKm[as.character(promDominant$consensus.cluster)] %>%
+    findOverlaps(query = tssR) %>%
+    as_tibble() %>%
+    group_by(subjectHits) %>%
+    summarise(tssI=list(queryHits)) %>%
+    as.list() %>%
+    `[[<-`(1, as.list(.[[1]])) %>%
+    {
+        map2(.[[1]], .[[2]], function(promDominantI, tssL) 
+        {
+            cbind(start(tssR[tssL]), apply(tssExprM[tssL, 23:34, drop=F], 1, mean))
+        })
+    }
+#tmpq <- .Last.value
+
+toIqw %>% map(~iqw(.[,1], .[,2], q=0.1)) %>% unlist()
+
+
+```
+
+
+
+#########################
+The 30p epi; dominant TSS classification.
+Since we are redoing it now almost from scratch, we can plan ahead to only
+use such TCs which 
+* fall into consensus clusters AND 
+* are present in dome or prim5
+We can do in per consensus cluster:
+  select best TSS in summed expression of both stages.
+  This way is "symmetric" plus more stable.
+  We can even start from consensus and tc-agnostically select best TSS in summed (canonical or not) expression.
+
+
+```{r}
+#TODO: extract stats of TSSs within TSSr: IQw in dome and prim5, sd, measure of dominance? TO be fed into promDominant and then propagates further.
+tssR <- cs.canon@CTSScoordinates %>% 
+    #head(10000) %>%
+    {GRanges(.$chr, IRanges(.$pos, width=1), .$strand, seqinfo=seqinfo(Drerio))}
+    # above: CTSSs from all samples, no counts
+tssExprM <- cs.canon@normalizedTpmMatrix %>% as.matrix()
+
+consClusBestTss <- findOverlaps(tssR, consClusKm) %>% as_tibble() %>% 
+    group_by(subjectHits) %>% 
+    summarise(tssI=list(queryHits)) %>% as.list() %>%
+    `[[<-`(1, as.list(.[[1]])) %>%   # now it is a list of two: tssR index (basically 1:27781)
+                                     # and groups of tssR indices. (2385683 elem in tssR)
+    {map2(.[[1]], .[[2]], function(consCluI, tssL)
+    {
+        # mean over postmbt samples, followed by max over TSSs.
+        postMbtMeanE <- apply(tssExprM[tssL, 23:34, drop=F], 1, mean)   # 21 is sheld+, 23 is somites+
+        wm <- which.max(postMbtMeanE)
+        ret <- cs.canon@CTSScoordinates[tssL, ][wm, ]
+        ret$consensus.cluster <- consClusKm[consCluI]$consensus.cluster
+        ret$postMbtMaxMeanE <- postMbtMeanE[wm]
+        ret$postMbtItsConsensusClusterMeanExpr <- tssExprM[tssL, 23:34, drop=F] %>% colSums() %>% mean()
+        ret$postMbtItsConsensusClusterMaxExpr  <- tssExprM[tssL, 23:34, drop=F] %>% colSums() %>% max()
+        ret
+    })} %>% reduce(rbind)
+
+all.equal(as.character(consClusBestTss$consensus.cluster), names(consClusKm))
+# true;
+
+consClusBestTss$postMbtMaxMeanE %>% {Ecdf(.+1, what="1-F", log="x")}
+abline(v=2); abline(v=1.5); abline(v=1.2)
+# so 1tpm seems like reasonable cutoff, maybe 2. Probably depends on sample quality
+
+#sm.atacDomeMert.2.1 %>% heatMatrix(winsorize=c(0, 97), clustfun=function(x) kmeans(x, 2, iter.max=100, nstart=5)$centres
+ #                               )
+
+
+#    tunePromoters(by=dyadShift[reprPromI], cutBy=199) %>%
+#    kmeans(centers=8, iter.max=120, nstart=20)
+```
+
+```{r fig.height=7, fig.width=7}
+Ecdf(consClusBestTss$postMbtItsConsensusClusterMeanExpr+1, what="1-F", log="x")
+Ecdf(consClusBestTss$postMbtItsConsensusClusterMaxExpr+1, what="1-F", log="x")
+Ecdf(consClusBestTss$postMbtMaxMeanE+1, what="1-F", log="x")
+abline(v=1.2)
+smoothScatter(log2(consClusBestTss$postMbtItsConsensusClusterMeanExpr+1), log2(consClusBestTss$postMbtMaxMeanE+1), nbin=200, bandwidth=0.05)
+
+```
+
+
+
+
+```{r}
+# this filtering leaves out promoters not expressed in POSTMBT, or to be more
+# precise which don't have TSS with mean post mbt expression over the cutoff.
+# In the analysis the remaining promoters should be shown somewhere in the supp
+# Probably aligned to whatever works instead of post MBT TSS.
+#
+# Filters from 27781 to 15859 at 1.0 tpm
+#                    to 19099 at 0.5 tpm
+#                    to 21914 at 0.2 tmp  <--- chosen
+promDominant <- consClusBestTss %>% {.[.$postMbtMaxMeanE >= 0.2, ]} %>% 
+    {GRanges(.$chr, IRanges(.$pos, width=1), .$strand, 
+             consensus.cluster=.$consensus.cluster,
+             postMbtMaxMeanE = .$postMbtMaxMeanE, 
+             postMbtItsConsensusClusterMeanExpr = .$postMbtItsConsensusClusterMeanExpr,
+             postMbtItsConsensusClusterMaxExpr = .$postMbtItsConsensusClusterMaxExpr,
+             seqinfo=seqinfo(Drerio))} %>%
+    GenomicRanges::resize(800, fix="start") %>% GenomicRanges::resize(1600, fix="end") %>% 
+    {.[. == trim(.)]}
+
+mcols(promDominant) <- addnotateTranscripts(narrow(promDominant, start=800, end=799)) %>% mcols()
+# this is wrong... because I thought it narrows by the amount from start and end
+# but these are coordinates of new start and new end relative to the original coords...
+# should be narrow(promDominant, start=801, end=801) to have the TSS.
+# but there is somewhere another off-by-one, maybe in my code maybe in Vania's
+# so narrow(promDominant, start=800, end=800) is what intersects well with consClusKm
+
+# the same repeated for the remaining promoters
+promNonDominant <- consClusBestTss %>% {.[.$postMbtMaxMeanE < 0.2, ]} %>% 
+    {GRanges(.$chr, IRanges(.$pos, width=1), .$strand, 
+             consensus.cluster=.$consensus.cluster,
+             postMbtMaxMeanE = .$postMbtMaxMeanE, 
+             postMbtItsConsensusClusterMeanExpr = .$postMbtItsConsensusClusterMeanExpr,
+             postMbtItsConsensusClusterMaxExpr = .$postMbtItsConsensusClusterMaxExpr,
+             seqinfo=seqinfo(Drerio))} %>%
+    GenomicRanges::resize(800, fix="start") %>% GenomicRanges::resize(1600, fix="end") %>% 
+    {.[. == trim(.)]}
+
+mcols(promNonDominant) <- addnotateTranscripts(narrow(promNonDominant, start=800, end=799)) %>% mcols()
+# this works well even if it is off by 2.
+```
+
+
+
+
+2020-12 because we redefined promDominant (and created promNonDominant)
+
+
+```{r}
+ScoreMatrixFromBigWig <- function(bwF, regions)
+{
+    dat <- import.bw(bwF, which=regions) %>% fixSeqinfo()
+    ScoreMatrix(dat, regions, strand.aware=T, weight.col="score")
+}
+
+ScoreMatrixBinFromBigWig <- function(bwF, regions, bin.num=600)
+{
+    dat <- import.bw(bwF, which=regions) %>% fixSeqinfo()
+    ScoreMatrixBin(dat, regions, strand.aware=T, weight.col="score", bin.num = bin.num)
+}
+```
+Overall 24h looks much cleaner (longPec even more, but 24h has more datasets)
+```{r fig.height=8, fig.width=8}
+sp.atac.prim5 <- ScoreMatrixFromBigWig("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/prim5.cuts.ext2.binSize1.bw", promDominant)
+sp.atac.prim5 %>% rowMeans() %>% Ecdf(what="1-F", log="y")
+
+{pdf(file="sp.atac.prim5.pdf", width=9, height=16);
+heatMatrix(sp.atac.prim5, winsorize=c(0,99))
+dev.off()}
+
+sp.atac.prim5 %>% as.vector() %>% summary()
+# mean is 0.012, 3rd quartile is 0.007
+
+{pdf(file="sp.atac.prim5.logPc0006.pdf", width=9, height=16, title="pc 0.006");
+heatMatrix(log2(sp.atac.prim5+0.006))
+dev.off()}
+
+## smoothed version (not written in the script)
+{pdf(file="sp.atac.prim5.logPc0006.smooth.pdf", width=9, height=16, title="pc 0.006");
+heatMatrix(log2(foo+0.006))
+dev.off()}
+## smoothed with ebimage
+{pdf(file="sp.atac.prim5.logPc0006.smoothEbi.pdf", width=9, height=16, title="pc 0.006");
+heatMatrix(log2(foo+0.006))
+dev.off()}
+
+{pdf(file="sp.atac.prim5.logPc0003.pdf", width=9, height=16, title="pc 0.003");
+heatMatrix(log2(sp.atac.prim5+0.003))
+dev.off()}
+
+{pdf(file="sp.atac.prim5.logPc0012.pdf", width=9, height=16, , title="pc 0.012");
+heatMatrix(log2(sp.atac.prim5+0.012))
+dev.off()}
+
+{pdf(file="sp.atac.prim5.logPc0001.pdf", width=9, height=16, title="pc 0.001");
+heatMatrix(log2(sp.atac.prim5+0.001))
+dev.off()}
+
+
+```
+Keep 8 classes as we used to, but try different pseudocounts
+```{r}
+# log ATAC levels on varying pseudocounts
+kpL.prim5 <- c(0.001, 0.003, 0.006, 0.012) %>% 
+    map(~log2(sp.atac.prim5+.) - log2(.)) %>%
+    future_map(~kmeans(., iter.max=120, nstart=10, centers=8), 
+               .progress=T, .options=furrr_options(seed=4991))
+
+# smoothed ATAC profiles, and then 
+krL.prim5 <- smoothHeatmatrixRows(sp.atac.prim5, kern.n3) %>% 
+    future_map(.x=c(0.001, 0.003, 0.006, 0.012) %>% `names<-`(.,.), ., .f=function(pc, sm)
+        {
+            log2(sm + pc) - log2(pc)
+        }) %>%
+    future_map(~kmeans(., iter.max=120, nstart=10, centers=8), 
+               .progress=T, .options=furrr_options(seed=4991))
+# kill hanging R workers:
+future:::ClusterRegistry("stop")
+
+krL.prim5 %>% map(~.$centers) %>% map(t) %>% map(~
+    {
+        matplot(x=-800:799, y=., type='l', lty=c(1,1,1,1,2,2,2,2), lwd=2, xlab="", ylab="")
+        legend("topright", legend=1:8, col = 1:6, lty=c(1,1,1,1,2,2,2,2), lwd=2)
+    })
+kpL.prim5 %>% map(~.$centers) %>% map(t) %>% map(~matplot(x=-800:799, y=., type='l', lty=1, lwd=1, xlab="", ylab=""))
+koL.prim5[[8]]$centers %>% t %>% matplot(x=-800:799, y=., type='l', lty=1, lwd=1, xlab="", ylab="")
+```
+
+
+```{r}
+# clustering on sharp (2bp resolution) dome ATAC
+koL.dome <- future_map(1:12, ~kmeans(so.atac.domeFlt@.Data, iter.max=120, nstart=1, centers=.),
+                       .progress=T, future.seed=4991)  # probably better one core
+koL.prim5 <- future_map(1:12, ~kmeans(so.atac.prim5@.Data, iter.max=120, nstart=2, centers=koL.dome[[.]]$centers),
+                       .progress=T, future.seed=4991)  # probably better one core
+
+```
+
+
+```{r}
+clus2topGo(clus=km2clus(koL.dome[[8]], prom=promDominantFlt),
+           promDominantFlt, txDb=txDb, nTop=32)
+```
+
+
+Genereate various score matrices
+```{r}
+
+
+ScoreMatrixRegex <- function(pattern, regions, genome=Drerio)
+{
+    getSeq(genome, regions) %>% 
+        as.character() %>% 
+        str_locate_all(pattern) %>%
+        map(function(match)
+        {
+            ret <- rep(0.0, 1600)
+            for( i in seq_along(match[ , 1, drop=T]))
+                ret[match[i, "start"] : match[i, "end"]] <- 1
+            ret
+        }) %>% 
+        reduce(rbind)
+}
+
+
+```
+
+
+
+
+
+```{r  fig.height=2, fig.width=2}
+promDominantFlt$consensus.cluster <- promDominantFlt$consCluI
+
+overlapAtacWithExprClasses2 <- function(km,
+             exprC=consClusKm[prom$consensus.cluster %>% as.character()]$som.5.5.pc05.fullNorm)
+{
+    cbind.data.frame(atacC=km$cluster, 
+                     exprC=exprC) %>%
+        as_tibble() %>% 
+        group_by(atacC, exprC) %>% 
+        summarise(ov=length(exprC)) %>%
+        pivot_wider(names_from=exprC, values_from=ov) %>% 
+        ungroup() %>% 
+        select(-"atacC") %>%
+        as.matrix() %>%
+        `rownames<-`(paste("atacC", seq(1, dim(.)[1]))) %>%
+        { 
+            expected <- rowSums(.) %*% t(colSums(.)) / sum(.)
+            observed <- .
+            ll <- list(observed=observed, expected=expected, overrepr=observed/expected) %>%
+                map(function(k)
+                {
+                    k %>%
+                        t() %>%
+                        as.data.frame() %>%
+                        map(matrix, nrow=5, ncol=5)  # indices (x, y) of the original som coords)
+                })
+
+            ll$overrepr %>% map(function(l)
+                {
+                    ColorRamp <- colorRampPalette(list("blue", "white", "red"))(256)
+                    ColorLevels <- seq(from=-1, to=1, length=256)
+                    xmin = -1
+                    xmax = 1
+                    ColorRamp_ex <- ColorRamp[round(1+(min(l)-xmin)*10000/(xmax-xmin)) :
+                                                  round( (max(l)-xmin)*10000/(xmax-xmin) )]
+                    par(mar=c(0,0,0,0))
+                    log2(l[5:1, ]) %>%
+                        {image(t(as.matrix(.)), col=ColorRamp, las=1, xlab='',ylab='',cex.axis=1, xaxt='n',yaxt='n')}
+                    # in the image lowest row is x=1, y=1..5
+                })
+            #ll$observed
+            #paste(as.character(ll$observed), as.character((ll$expected)), sep = '/') %>% 
+            #          matrix(nrow = 5, ncol = 5)
+            #Sll$expected
+            ll
+        }
+} 
+
+
+overlapAtacWithExprClasses(krL.prim5[["0.006"]], prom=promDominant) -> wrr
+map2(wrr$observed, wrr$expected, ~paste(.x, round(.y), sep='/') %>% matrix(5,5)) 
+map(wrr$observed, sum)
+
+```
+
+```{r}
+library(networkD3)
+links <- tibble(domeC=koL.dome[[8]]$cluster, prim5C=koL.prim5[[8]]$cluster, one=1) %>%
+                  group_by(domeC, prim5C) %>% 
+                  summarise(num=length(one))
+links$domeC  <- links$domeC-1;
+links$prim5C <- links$prim5C+8-1;
+nodes <- data.frame(name=c(paste("dome", 1:8), paste("prim5", 1:8)))
+sankeyNetwork(Links = links, Source = "domeC", Target = 'prim5C', Value = "num",
+              Nodes = nodes, NodeID = "name", unit="proms",
+              fontSize = 12, nodeWidth = 30)
+```
+
+```{r fig.height=12, fig.width=9}
+#smoothing of heat matrix
+smoothHeatmatrixRows <- function(sm, smoothW)
+{
+    sm@.Data <- EBImage::filter2(sm@.Data, matrix(smoothW, nrow=1), 
+                                 boundary = "replicate")
+    sm
+}
+foo <- smoothHeatmatrixRows(so.atac.domeFlt, kern.n3)
+pdf("foo.n3.pdf")
+heatMatrix(foo, 
+           group=km2clus(koL.dome[[8]], promDominantFlt),
+           winsorize=c(0,97),xcoords=c(-800, 800)
+        )
+dev.off()
+
+
+```
+
+
+Final figures: plotting of CAGE for each class in fw and reverse on the same plot.
+```{r}
+plotAggregatedCageBothStrands <- function(km=koL.dome[[8]], prom=promDominantFlt, 
+                                          trimEdgesBp=50, zeroAt=800, xlab="", ylab2="",
+                                          ylab="", classNames=NULL,
+                                          sm.cageFw    = so.cagePostMbtFwNoLog,
+                                          sm.cageRev   = so.cagePostMbtRevNoLog,
+                                          sm.atacDome  = so.atac.domeFlt,
+                                          sm.atacPrim5 = so.atac.prim5)
+{
+    fwL <- clus2phastCons(km2clus(km, prom=prom), prom,
+               sm.cageFw,
+               smoothW=kern.n1)
+
+    revL <- clus2phastCons(km2clus(km, prom=prom), prom,
+               sm.cageRev,
+               smoothW=kern.n1)
+    
+    atac.dome.2bp <- clus2phastCons(km2clus(km, prom=prom), prom,
+               sm.atacDome / sum(sm.atacDome),
+               smoothW=kern.n2)
+    
+    atac.prim5.2bp <- clus2phastCons(km2clus(km, prom=prom), prom,
+               sm.atacPrim5 / sum(sm.atacPrim5),
+               smoothW=kern.n2)
+    
+    xWid <- dim(sm.cageFw)[2]
+    
+    pmap(list(fwL, revL, atac.dome.2bp, atac.prim5.2bp, seq_along(fwL)), #atac.longPec.2bp, atac.oblong.2bp, 
+         function(fw, rev, a1, a2, i) #a3, a4, 
+    {
+        par(mar=c(5.1, 4.1, 4.1, 4.1))
+        matplot(x=(1-zeroAt+trimEdgesBp):(xWid-trimEdgesBp-zeroAt), 
+                y=cbind(fw, rev) %>% `[`((1+trimEdgesBp):(xWid-trimEdgesBp), ) * 10e6,
+                type="l", ylab=ylab, 
+                xlab=xlab, axes=F, lwd=1.5, 
+                lty=1,
+                #col=1:8, lty=rep(1:3, each=8),
+                main=ifelse(is.null(classNames), paste("class", i), classNames[i]),
+                ylim=c(0, max(fw)*0.8 * 10e6))  # heuristics
+        axis(1, at=seq(-800, 800, 100), col.axis="black", las=2)
+        axis(2)
+        abline(v=seq(-800, 800, 100), col="lightgray", lty="dotted", lwd=1)
+        abline(h=0, col="gray")
+        abline(v=0, col="gray")
+        #legend("topright", legend=1:length(clus), col=1:8, lty=rep(1:3, each=8), lwd = 1.5)
+        
+        par(new=TRUE, mar=c(5.1, 4.1, 4.1, 4.1))
+        matplot(x=(1-zeroAt+trimEdgesBp):(xWid-trimEdgesBp-zeroAt),
+             y=cbind(a1, a2), #, a3, a4
+             type="l", col=c("lightblue", "lightgreen", "purple", "lightgreen"), lty=1,
+             xlab="", ylab="", axes=F)
+        axis(4)
+        mtext(ylab2, side=4, line=3)
+        legend("topleft", legend = c("forward CAGE", "reverse CAGE"), lwd=1.5, col=1:2)
+        legend("topright", legend = c("dome ATAC", "prim 5 ATAC"), lwd=1.5,
+                                      col=c("lightblue", "lightgreen"))
+    })
+    invisible(0)
+}
+
+
+plotSmallCageBothStrands <- function(km=koL.dome[[8]], prom=promDominantFlt, 
+                                     trimLeftBp=50, trimRightBp=50, #trimEdgesBp=50, 
+                                     zeroAt=800, xlab="", ylab2="",
+                                     ylab="", classNames=NULL,
+                                     sm.cageFw    = so.cagePostMbtFwNoLog,
+                                     sm.cageRev   = so.cagePostMbtRevNoLog,
+                                     outFStub=NULL)
+{
+    fwL <- clus2phastCons(km2clus(km, prom=prom), prom,
+               sm.cageFw,
+               smoothW=kern.n1)
+
+    revL <- clus2phastCons(km2clus(km, prom=prom), prom,
+               sm.cageRev * 10,
+               smoothW=kern.n1)
+
+    xWid <- dim(sm.cageFw)[2]
+    
+    pmap(list(fwL, revL, seq_along(fwL)), 
+         function(fw, rev, i)
+    {
+        if(!is.na(outFStub))
+            png(paste0(outFStub, ".", classNames[i], ".png"), 800, 60)
+        par(mar=c(0, 0, 0, 0))
+        matplot(x=(1-zeroAt+trimLeftBp):(xWid-trimRightBp-zeroAt), 
+                y=cbind(fw, rev) %>% `[`((1+trimLeftBp):(xWid-trimRightBp), ) * 10e6,
+                type="l", ylab=ylab, 
+                xlab=xlab, axes=F, lwd=1.5, yaxs='i',xaxs='i',
+                lty=1,
+                ylim=c(0, max(fw)*0.9 * 10e6))  # heuristics
+        abline(h=0, col="gray")
+        abline(v=0, col="gray")
+        if(!is.na(outFStub))
+            dev.off()
+    })
+    invisible(0)
+}
+
+```
+
+```{r fig.height=1.3, fig.width=10}
+plotSmallCageBothStrands(km = krL.prim5[["0.006"]],
+                         prom = promDominant, trimLeftBp = 100, trimRightBp = 200,
+                         sm.cageFw = sp.cagePostMbtFwNoLog,
+                         sm.cageRev = sp.cagePostMbtRevNoLog,
+                         classNames = c("double NFR", "medium zygotic", "narrow", "wide",
+                                        "medium constitutive", "upstream offset", 
+                                        "weak open", "strong open"),
+                         xlab="", ylab="", outFStub = "cageBothStrands" )
+```
+
+
+```{r fig.height=6, fig.width=10}
+plotAggregatedCageBothStrands(trimEdgesBp=00, xlab="position relative to the dominant post-MBT TSS",
+                              ylab="CAGE expression [average tags]")
+```
+
+
+```{r}
+som.5.5.pc05.fullNorm$visual$qerror %>% hist(100)
+som.5.5.pc05.fullNorm$visual$qerror %>% {sum(.>5)/length(.)}
+```
+
+```{r}
+kmean.qual <- function(km, x)
+{
+    (x - km$centers[km$cluster, ])^2 %>% rowMeans()
+}
+kmean.qual(koL.dome[[8]], so.atac.domeFlt@.Data) %>% Ecdf(what="1-F", log="x"); grid()
+# 0.001 ~~ 10%
+# 0.0005 ~~ 20% removed
+
+# makes a kmeans smaller by removing stuff above threshold
+filter.km <- function(km, x, thr)
+{
+    I <- (kmean.qual(km, x) <= thr)
+    ret <- km
+    ret$cluster <- km$cluster[I]
+    ret$size <- km$cluster %>% table()
+    # not updating totss, withinss, tot.withinss, betweenss
+    ret
+}
+
+filter.km(koL.dome[[8]], so.atac.domeFlt@.Data, 0.001)
+
+# adds a new class to kmeans, the ones with poor clustering quality
+hide.km <- function(km, x, thr)
+{
+    I <- (kmean.qual(km, x) > thr)
+    ret <- km
+    nclus <- length(km$size)
+    ret$cluster[I] <- nclus+1
+    ret$size <- ret$cluster %>% table() %>% as.vector() %>% `names<-`(1:(nclus+1))
+    ret$centers <- x %>% split.data.frame(ret$cluster) %>% map(colMeans) %>% reduce(rbind)
+    #attr(ret$centers, "dimnames") <- list(c(attr(km$centers, "dimnames")[[1]],
+    #                                        as.character(nclus+1)),
+    #                                      NULL)
+    ret$withinss <- rep(0, nclus+1)
+    ret
+}
+
+foo <- hide.km(koL.dome[[8]], so.atac.domeFlt@.Data, 0.001)
+foo$size
+#   1    2    3    4    5    6    7    8    9 
+#2361  311  634 2825   32 8443 9767  397 2170 
+  koL.dome[[8]]$size
+#2641  600  905 2937  502 8446 9767 1142
+
+```
+##
+classes 5,8,2 are the worst ones as it comes to quality.
+1267   51  217 1688 8276 9756    2 5683 
+
+```{r}
+kmean.qual(koL.dome[[8]], so.atac.domeFlt@.Data) %>% 
+    split(koL.dome[[8]]$cluster) %>% safeEcdf(col=rainbow(9))
+```
+
+```{r}
+plot.som.violin(som.s7, color=F, ylim=c(-8,8), yadj=0.0, circlecol=NULL)
+```
+
+
+```{r fig.height=3, fig.width=3}
+overlapAtacWithExprClasses(km=krL.prim5[["0.006"]],
+                            consClusKm[promDominant$consensus.cluster %>% as.character()]$som.5.5.pc05.fullNorm)
+```
+
+```{r fig.height=3, fig.width=3}
+overlapAtacWithExprClasses(kpL.prim5[[3]], 
+                           som=consClusKm[promDominant$consensus.cluster %>% as.character()]$som.s7)
+
+```
+
+```{r fig.height=3, fig.width=3}
+overlapAtacWithExprClasses(krL.prim5[["0.006"]], 
+                           som=consClusKm[promDominant$consensus.cluster %>% as.character()]$som.s7)
+
+```
+
+```{r fig.height=1, fig.width=1}
+overlapAtacWithExprClasses(krL.prim5[["0.006"]], 
+                           som=consClusKm[promDominant$consensus.cluster %>% as.character()]$som.s7,
+                           ColorRamp = colorRampPalette(list("darkgreen", "white", "chocolate"))(256),
+                           overReprTextF = F, scaleMax = 3)
+
+```
+
+This is the final for figure4: fig4f
+```{r fig.height=1, fig.width=1}
+overlapAtacWithExprClasses(krL.prim5[["0.006"]], 
+                           som=consClusKm[promDominant$consensus.cluster %>% as.character()]$som.s7,
+                           ColorRamp = colorRampPalette(list("darkgreen", "white", "chocolate"))(256),
+                           overReprTextF = F, scaleMax = 2.4, plotF = T, 
+                           kmNames = c("double NFR", "medium zygotic", "narrow", "wide", "medium constitutive",
+                                       "upstream offset", "weak open", "strong open"))
+
+```
+
+We need also a heatmap scale for the figure: fig4
+```{r}
+fig4fScale <- function(ColorRamp, scaleMax)
+{
+    ColorBreaks <- seq(from=-scaleMax, to=scaleMax, length=257)
+    image(matrix(ColorBreaks, ncol = 1), col=ColorRamp, breaks=ColorBreaks,
+          axes = F)
+    box()
+    ticks = c(-2, -1, 0, 1, 2)
+    axis(1, at = (ticks / scaleMax + 1) / 2, labels = ticks )
+}
+
+fig4fScale(ColorRamp = colorRampPalette(list("darkgreen", "white", "chocolate"))(256),
+            scaleMax = 2.4)
+
+pdf("fig4fScale.pdf", width = 4, height = 2)
+fig3fScale(ColorRamp = colorRampPalette(list("darkgreen", "white", "chocolate"))(256),
+            scaleMax = 2.4)
+dev.off()
+```
+
+
+```{r fig.height=4, fig.width=4}
+overlapAtacWithExprClasses(krL.prim5[["0.003"]], 
+                           som=consClusKm[promDominant$consensus.cluster %>% as.character()]$som.s9)
+
+```
+
+
+```{r fig.height=4.5, fig.width=4.5}
+overlapAtacWithExprClasses(krL.prim5[["0.006"]], 
+                           som=consClusKm[promDominant$consensus.cluster %>% as.character()]$som.s8)
+```
+
+```{r fig.height=4, fig.width=4}
+overlapAtacWithExprClasses(krL.prim5[["0.006"]], 
+                           som=consClusKm[promDominant$consensus.cluster %>% as.character()]$som.s9)
+```
+
+Testing of the plotting function:
+```{r fig.height=3, fig.width=3}
+overlapAtacWithExprClasses(krL.prim5[["0.006"]], 
+                           som=c(complex(21911, 0, 0), complex(2, 4, 0), complex(1, 0, 4)))
+```
+
+```{r}
+elementwiseFisherTest <- function(m)
+{
+    d1 <- dim(m)[1]
+    d2 <- dim(m)[2]
+    #ret <- matrix(NA, nrow=d1, ncol=d2)
+    fishers <- map(1:d1, function(i)
+    {
+        map(1:d2, function(j)
+        {
+            contingency <- matrix(c(m[i,j],
+                     sum(m[setdiff(1:d1, i), 1]),
+                     sum(m[1, setdiff(1:d2, j)]),
+                     sum(m[setdiff(1:d1, i), setdiff(1:d2, j)])),
+                   nrow=2, ncol=2)
+            fisher.test(contingency)  #$p.value
+        }) 
+    })
+    pvals <- fishers %>% map(function(e) {map(e, `$`, "p.value") %>% reduce(c)}) %>% reduce(c)
+    oddsr <- fishers %>% map(function(e) {map(e, `$`, "estimate") %>% reduce(c)}) %>% reduce(c)
+    
+    return(list(
+        pvals = p.adjust(pvals, method="BH") %>%
+            matrix(nrow=d1, ncol=d2, byrow=T),
+        oddsr = oddsr %>%
+            matrix(nrow=d1, ncol=d2, byrow=T)
+    ))
+}
+
+```
+
+--
+Export for UMAP
+
+```{r}
+saveRDS(object=consClusKm[promDominant$consensus.cluster %>% as.character()], file="consClusKm_of_promDominant.RDS")
+saveRDS(object=consClusKm[promNonDominant$consensus.cluster %>% as.character()], file="consClusKm_of_promNonDominant.RDS")
+
+promDominant$krL.prim5.0006 <- krL.prim5[["0.006"]]$cluster
+promDominant$krL.prim5.0012 <- krL.prim5[["0.012"]]$cluster
+saveRDS(object=promDominant, "promDominant_with_krL.RDS")
+saveRDS(promNonDominant, "promNonDominant.RDS")
+
+```
+
+
+```{r}
+# A function which converts a grange to a kernel profile. Effectively enlarges each grange to many
+# kernel needs to be even-size vector. Ideally normalised to sum_i v_i = 1.0
+# Keeps the strand as is.
+read2kernel <- function(x, kernel)
+{
+    # iteratively narrow the original read and add score column
+    # Find out the centre (assuming the kernel is symmetric)
+    x <- resize(x, width = 1, fix = "center")
+    kernHalfWid <- floor(length(kernel) / 2)
+    map((-kernHalfWid):kernHalfWid,
+        function(kernShifFromMid)
+        {
+            ret <- shift(x, kernShifFromMid)
+            ret$score <- kernel[kernShifFromMid + kernHalfWid + 1]
+            ret
+        }) %>%
+        do.call(what=c)
+}
+
+# test data:
+read2kernel(c(GRanges("a:5-10"), GRanges("a:10-17")), kern.n1)
+
+
+```
+
+
+```{r}
+# Makes a scoreMatrix out of ATAC RDS file (prepared when mapping reads)
+atacRds2Sm <- function(rdsF, promR, minWidth = 165, maxWidth = 250, kernel=NULL)
+{
+    a <- readRDS(rdsF)
+    a <- a[(width(a) >= minWidth) & (width(a) <= maxWidth)]
+    num <- length(a)
+    a <- subsetByOverlaps(a, promR + 1000)
+    if(is.null(kernel))
+        ret <- ScoreMatrix(a, promR, strand.aware = T)
+    else if(length(kernel) == 1)  # read length to replace the true one, anchored at centre
+    {
+        a <- resize(a, width = as.integer(kernel), fix = "center")
+        ret <- ScoreMatrix(a, promR, strand.aware = T)
+    }
+    else  # it is a 1D kernel e.g c(0.25, 0.5, 0.25)
+    {
+        a <- read2kernel(a, kernel)
+        ret <- ScoreMatrix(a, promR, strand.aware = T, weight.col = "score")
+    }
+    ret <- ret * 1000000 / num
+    ret
+}
+```
+
+
+```{r}
+kernel149triangle <- c(1:75, 74:1) %>% {./sum(.)}
+```
+
+
+Genereate various score matrices
+```{r}
+sp.atac.prim5 <- ScoreMatrixFromBigWig("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/prim5.cuts.ext2.binSize1.bw", promDominant)
+
+sp.atac.dome  <- ScoreMatrixFromBigWig("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/dome.cuts.ext2.binSize1.bw", promDominant)
+
+sp.atac.oblong <- ScoreMatrixFromBigWig("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/oblong-DCD003161SQ.cuts.ext2.binSize1.bw", promDominant)
+
+sp.atac.longPec <- ScoreMatrixFromBigWig("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/longPec.cuts.ext2.binSize1.bw", promDominant)
+
+sp.nonoNucAtac.prim5 <- atacRds2Sm("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/prim5.RDS",
+                                   promDominant)
+
+sp.monoNucAtac.prim5.kernn50 <-
+    atacRds2Sm("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/prim5.RDS",
+               promDominant, kernel = kern.n50)
+
+sp.monoNucAtac.prim5.kernn30 <-
+    atacRds2Sm("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/prim5.RDS",
+               promDominant, kernel = kern.n30)
+
+sp.monoNucAtac.prim5.wid150 <-
+    atacRds2Sm("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/prim5.RDS",
+               promDominant, kernel = 150)
+
+sp.monoNucAtac.prim5.wid100 <-
+    atacRds2Sm("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/prim5.RDS",
+               promDominant, kernel = 100)
+
+sp.monoNucAtac.prim5.triangle149 <-
+    atacRds2Sm("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/prim5.RDS",
+               promDominant, kernel = kernel149triangle)
+
+
+sp.nucFreeAtac.prim5 <- atacRds2Sm("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/prim5.RDS",
+                                   promDominant, minWidth = 40, maxWidth = 120)
+
+sp.diNucAtac.prim5 <- atacRds2Sm("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/prim5.RDS",
+                                   promDominant, minWidth = 275, maxWidth = 355)
+
+sp.nonoNucAtac.oblong <- atacRds2Sm("/mnt/biggles/csc_home/piotr/Work/ATAC_bbsrc/Tracks/CutSites/oblong-DCD003161SQ.RDS",
+                                    promDominant)
+
+sp.k4.30pe <- ScoreMatrixFromBigWig("/mnt/biggles/csc_home/piotr/Work/ChIP_bbsrc/Tracks/Coverage/H3K4me3.30pEpi.rep2_test.BBSRC.2016-12.danRer10.peSpan.bw", promDominant)
+
+
+# from somites on
+sp.cagePostMbtFwNoLog <- ScoreMatrixFromTwoBigWigsSafe(
+    c("../AnalysisUnmerged/tss.postMbt.canon.+.bw",
+      "../AnalysisUnmerged/tss.postMbt.canon.-.bw"),
+    promDominant, negateMinusStrand=F)
+
+sp.cagePostMbtRevNoLog <- ScoreMatrixFromTwoBigWigsSafe(
+    c("../AnalysisUnmerged/tss.postMbt.canon.-.bw",
+      "../AnalysisUnmerged/tss.postMbt.canon.+.bw"),
+    promDominant, negateMinusStrand=F)
+
+# until high (oblong not)
+sp.cagePreMbtFwNoLog <- ScoreMatrixFromTwoBigWigsSafe(
+    c("../AnalysisUnmerged/tss.preMbt.canon.+.bw",
+      "../AnalysisUnmerged/tss.preMbt.canon.-.bw"),
+    promDominant, negateMinusStrand = F)
+
+sp.cagePreMbtRevNoLog <- ScoreMatrixFromTwoBigWigsSafe(
+    c("../AnalysisUnmerged/tss.preMbt.canon.-.bw",
+      "../AnalysisUnmerged/tss.preMbt.canon.+.bw"),
+    promDominant, negateMinusStrand = F)
+
+sp.gc <- getSeq(Drerio, promDominant) %>% 
+    as.character() %>% 
+    base::strsplit("") %>% 
+    map(~.%in% c("G", "C")) %>% 
+    map(as.numeric) %>% 
+    do.call(what="rbind")
+
+sp.wwPlus <- getSeq(Drerio, promDominant) %>% 
+    as.character() %>% 
+    base::strsplit("") %>% 
+    map(~.%in% c("A", "T")) %>% 
+    map(~as(.,"Rle")) %>% map(function(r)
+    {
+        runValue(r) <- ifelse(runLength(r) >= 2 & runValue(r) == T, TRUE, FALSE)
+        r %>% as.numeric()
+    }) %>%
+    do.call(what="rbind")
+
+sp.wwwwwPlus <- getSeq(Drerio, promDominant) %>% 
+    as.character() %>% 
+    base::strsplit("") %>% 
+    map(~.%in% c("A", "T")) %>% 
+    map(~as(.,"Rle")) %>% map(function(r)
+    {
+        runValue(r) <- ifelse(runLength(r) >= 5 & runValue(r) == T, TRUE, FALSE)
+        r %>% as.numeric()
+    }) %>%
+    do.call(what="rbind")
+
+stringMatchMatrix <- function(prom, regex, genome=Drerio)
+{
+    getSeq(genome, prom) %>% 
+    as.character() %>% 
+    str_locate_all(regex) %>%
+    map(function(match)
+    {
+        ret <- rep(0.0, 1600)
+        for(i in seq_along(match[ , 1, drop=T]))
+            ret[match[i, "start"]] <- 1
+        ret
+    }) %>% do.call(what="rbind")
+}
+
+# 100 promoters per second on one core:
+
+sp.cpg <- stringMatchMatrix(promDominant, "CG")
+
+# poor man's job by consensus...
+sp.CTCFplusConsens <- stringMatchMatrix(promDominant, "C[ATG][ACG][ACTG][AG]G[GA][GTA]G[GAT][ACT][GA]")
+sp.CTCFminusConsens <-stringMatchMatrix(promDominant, "[CT][TGA][CTA]C[CAT][CT]C[TC][ACTG][TGC][TAC]G")
+
+sp.TATAWAWR <- getSeq(Drerio, promDominant) %>% 
+    as.character() %>% 
+    str_locate_all("TATA[AT]A[AT][AG]") %>%
+    map(function(match)
+    {
+        ret <- rep(0.0, 1600)
+        for( i in seq_along(match[ , 1, drop=T]))
+            ret[match[i, "start"]] <- 1
+        ret
+    }) %>% do.call(what="rbind")
+
+sp.TATAWAWR.rev <- getSeq(Drerio, promDominant) %>% 
+    as.character() %>% 
+    str_locate_all("[TC][AT]T[AT]TATA") %>%
+    map(function(match)
+    {
+        ret <- rep(0.0, 1600)
+        for( i in seq_along(match[ , 1, drop=T]))
+            ret[match[i, "start"]] <- 1
+        ret
+    }) %>% do.call(what="rbind")
+
+sp.MteOhlerConsens <- stringMatchMatrix(promDominant, "C[GC]A[AG]C[GC][GC]AACG[CG]")
+sp.purine <- stringMatchMatrix(promDominant, "[AG]")
+sp.purineX2 <- stringMatchMatrix(promDominant, "[AG][AG]")
+sp.purineX4 <- stringMatchMatrix(promDominant, "[AG][AG][AG][AG]")
+sp.GA <- stringMatchMatrix(promDominant, "GA")
+sp.AA <- stringMatchMatrix(promDominant, "AA")
+sp.GG <- stringMatchMatrix(promDominant, "GG")
+sp.AG <- stringMatchMatrix(promDominant, "AG")
+
+sp.CCAT <- getSeq(Drerio, promDominant) %>% 
+    as.character() %>% 
+    str_locate_all("CCAT") %>%
+    map(function(match)
+    {
+        ret <- rep(0.0, 1600)
+        for( i in seq_along(match[ , 1, drop=T]))
+            ret[match[i, "start"] : match[i, "end"]] <- 1
+        ret
+    }) %>% do.call(what="rbind")
+
+sp.YC <- getSeq(Drerio, promDominant) %>% 
+    as.character() %>% 
+    str_locate_all("[CT]C") %>%
+    map(function(match)
+    {
+        ret <- rep(0.0, 1600)
+        for( i in seq_along(match[ , 1, drop=T]))
+            ret[match[i, "start"]] <- 1
+        ret
+    }) %>% do.call(what="rbind")
+
+sp.YR <- getSeq(Drerio, promDominant) %>% 
+    as.character() %>% 
+    str_locate_all("[CT][AG]") %>%
+    map(function(match)
+    {
+        ret <- rep(0.0, 1600)
+        for( i in seq_along(match[ , 1, drop=T]))
+            ret[match[i, "start"]] <- 1
+        ret
+    }) %>% do.call(what="rbind")
+
+sp.REST <- getSeq(Drerio, promDominant) %>% 
+    as.character() %>% 
+    str_locate_all("[TCG]CAG[CGT]ACC") %>%
+    map(function(match)
+    {
+        ret <- rep(0.0, 1600)
+        for( i in seq_along(match[ , 1, drop=T]))
+            ret[match[i, "start"] : match[i, "end"]] <- 1
+        ret
+    }) %>% do.call(what="rbind")
+
+sp.SP1 <- getSeq(Drerio, promDominant) %>% 
+    as.character() %>% 
+    str_locate_all("[GA]GG[CAT]GG[GAT]") %>%
+    map(function(match)
+    {
+        ret <- rep(0.0, 1600)
+        for( i in seq_along(match[ , 1, drop=T]))
+            ret[match[i, "start"] : match[i, "end"]] <- 1
+        ret
+    }) %>% do.call(what="rbind")
+
+sp.ELK <- getSeq(Drerio, promDominant) %>% 
+    as.character() %>% 
+    str_locate_all("[CG][CA]GGAA[GA]") %>%
+    map(function(match)
+    {
+        ret <- rep(0.0, 1600)
+        for( i in seq_along(match[ , 1, drop=T]))
+            ret[match[i, "start"] : match[i, "end"]] <- 1
+        ret
+    }) %>% do.call(what="rbind")
+
+sp.phastFish <- ScoreMatrix(import.bw("/mnt/biggles/data/PhastCons/danRer10/phastConsFish/ZF_GC_CC_GF.bw",
+                                      selection=BigWigSelection(promDominant)) %>% fixSeqinfo(),
+                             promDominant, strand.aware=T, weight.col="score")
+
+sp.phastVert <- ScoreMatrix(import.bw("/mnt/biggles/data/PhastCons/danRer10/phastCons12way/danRer10.phastCons12way.bw",
+                                      selection=BigWigSelection(promDominant)) %>% fixSeqinfo(),
+                            promDominant, strand.aware=T, weight.col="score")
+
+
+sp.grbTarget <- ScoreMatrix(grbTarget, promDominant, strand.aware=T)
+
+# all the below ones suffer from not being DNA features and biased annotation (multiple transcripts for some genes, ovarlapping transcripts etc)
+sp.cds <- ScoreMatrixPiotr(cds, promDominant)
+sp.cdsStart <- ScoreMatrixPiotr(cds(txDb) %>% promoters(0, 1) %>% GenomicRanges::reduce() , promDominant)
+sp.intron <- ScoreMatrixPiotr(introns %>% GenomicRanges::reduce(), promDominant)
+
+sp.transcriptReduced <- 
+    ScoreMatrixPiotr(transcripts(txDb) %>% GenomicRanges::reduce(), promDominant)
+sp.transcriptAntisenseReduced <- 
+    ScoreMatrixPiotr(transcripts(txDb) %>%  GenomicRanges::reduce( ) %>%
+                         {strand(.) <- ifelse(strand(.) == "+", "-", "+"); .},
+                promDominant)
+
+## chip-seqs for fig 4.
+# dependency: ChIP-seqs 
+fishPlotInputs <- list(
+  dome = list(
+#    peakRanges = peakGranges$dome,
+    assayFiles =  c(H3K4me3 = "/mnt/orca/damir/DANIO-CODE/DataFreeze_02/ChIP-seq/pipeline_output/DCD006178BS/out/signal/macs2/pooled_rep/ChIP-seq_Skarmeta_Lab_H3K4me3_0002AS.DCD000647SQ.USERpanosfirbas.R1.filt.deduplicated.nodup_pooled.pval.signal.bw",
+                    H3K27ac = "/mnt/storage/Damir/histones_marks/Skarmeta_H3K27ac_Dome_DCD000638SQ/signal/macs2/rep1/ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000638SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.pval.signal.bw",
+                    H3K4me1 = "/mnt/orca/damir/DANIO-CODE/DataFreeze_02/ChIP-seq/pipeline_output/DCD006178BSk4me1/signal/macs2/rep1/ChIP-seq_Skarmeta_Lab_H3K4me1_0002AS.DCD000657SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.pval.signal.bw"
+                    #ATAC = "/mnt/orca/damir/DanRer_ATAC-seq/pipeline_out/atac_dome/signal/macs2/pooled_rep/ATAC_dome_rep1.R1.trim.PE2SE.nodup.tn5_pooled.pf.pval.signal.bigwig"
+                    )
+    ),
+  Epi75 = list(
+ #   peakRanges = peakGranges$Epi75,
+    assayFiles = c(H3K4me3 = "/mnt/orca/damir/DANIO-CODE/DataFreeze_02/ChIP-seq/pipeline_output/DCD006177BS/out/signal/macs2/pooled_rep/ChIP-seq_Skarmeta_Lab_H3K4me3_0002AS.DCD000643SQ.USERpanosfirbas.R1.filt.deduplicated.nodup_pooled.pval.signal.bw",
+                   H3K27ac = "/mnt/storage/Damir/temp_histones/H3K27ac/Skarmeta_H3K27ac_75epiboly_1e-2/signal/macs2/pooled_rep/ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000633SQ.USERpanosfirbas.R1.filt.deduplicated.nodup_pooled.pval.signal.bw",
+                   H3K4me1 = "/mnt/storage/Damir/histones_marks/Skarmeta_H3K4me1_75-epiboly_DCD000656SQ/signal/macs2/rep1/ChIP-seq_Skarmeta_Lab_H3K4me1_0002AS.DCD000656SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.pval.signal.bw"
+                    #ATAC = "/mnt/orca/damir/DanRer_ATAC-seq/pipeline_out/atac_80epi/signal/macs2/pooled_rep/ATAC_80epi_rep1.R1.trim.PE2SE.nodup.tn5_pooled.pf.pval.signal.bigwig"
+                   )
+   ),
+  Hpf12 = list(
+  #  peakRanges = peakGranges$Hpf12,
+    assayFiles = c(H3K4me3 = "/mnt/orca/damir/DANIO-CODE/DataFreeze_02/ChIP-seq/pipeline_output/DCD006174BS/out/signal/macs2/pooled_rep/ChIP-seq_Skarmeta_Lab_H3K4me3_0002AS.DCD000641SQ.USERpanosfirbas.R1.filt.deduplicated.nodup_pooled.pval.signal.bw",
+                   H3K27ac = "/mnt/storage/Damir/temp_histones/H3K27ac/Skarmeta_H3K27ac_59somites_1e-2/signal/macs2/pooled_rep/ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000634SQ.USERpanosfirbas.R1.filt.deduplicated.nodup_pooled.pval.signal.bw",
+                     H3K4me1 = "/mnt/orca/damir/DANIO-CODE/new_samples/caper_test/chip/48ba3a5f-9564-4532-ac1e-f2775cdb625a/call-macs2_signal_track/shard-0/execution/Som-K4me1_S9_L001_R1_001.merged.nodup.pval.signal.bigwig"
+                   #ATAC = "/mnt/orca/damir/DanRer_ATAC-seq/pipeline_out/atac_8som/signal/macs2/pooled_rep/ATAC_8som_rep1.R1.PE2SE.nodup.tn5_ATAC_8som_rep2.R1.PE2SE.nodup.tn5.pf.pval.signal.bigwig"
+                   )
+    ),
+  prim5 = list(
+   # peakRanges = peakGranges$prim5,
+    assayFiles = c(H3K4me3 = "/mnt/orca/damir/DanRer_ChIP-seq_H3K4me3/Mueller_Prim-5/out/signal/macs2/pooled_rep/ChIP-seq_Mueller_lab_H3K4me3_0006AS.DCD001525SQ.USERdunjanik.R1.filt.deduplicated.nodup_pooled.tagAlign_x_ChIP-seq_Mueller_lab_Mock_0006AS.DCD001542SQ.USERdunjanik.R1.filt.deduplicated.nodup.tagAlign.pval.signal.bw",
+                   H3K27ac = "/mnt/orca/damir/DANIO-CODE/DataFreeze_02/ChIP-seq/pipeline_output/DCD006175BSk27ac/signal/macs2/rep2/ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000653SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.pval.signal.bw",
+                   H3K4me1 = "/mnt/orca/damir/DANIO-CODE/DataFreeze_02/ChIP-seq/pipeline_output/DCD006175BSk4me1/signal/macs2/rep1/ChIP-seq_Skarmeta_Lab_H3K4me1_0002AS.DCD000655SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.pval.signal.bw"
+                   #ATAC =  "/mnt/biggley/home/damir/pipelines/atac_dnase_pipelines/Skarmeta_Lab/signal/macs2/pooled_rep/ATAC-seq_Skarmeta_Lab_0001AS.DCD000394SQ.USERpanosfirbas.R1.trim.PE2SE.nodup.tn5_pooled.pf.pval.signal.bigwig"
+                   )
+   ),
+  longPec = list(
+    #peakRanges = peakGranges$longPec,
+    assayFiles = c(H3K4me3 = "/mnt/orca/damir/DANIO-CODE/DataFreeze_02/ChIP-seq/pipeline_output/DCD006173BS/out/signal/macs2/rep1/ChIP-seq_Skarmeta_Lab_H3K4me3_0002AS.DCD000640SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.pval.signal.bw",
+                   H3K27ac = "/mnt/orca/damir/DANIO-CODE/DataFreeze_02/ChIP-seq/pipeline_output/DCD006173BSk27ac/signal/macs2/rep1/ChIP-seq_Skarmeta_Lab_H3K27ac_0002AS.DCD000651SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.pval.signal.bw",
+                   H3K4me1 = "/mnt/orca/damir/DANIO-CODE/DataFreeze_02/ChIP-seq/pipeline_output/DCD006173BSk4me1/signal/macs2/rep1/ChIP-seq_Skarmeta_Lab_H3K4me1_0002AS.DCD000650SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.pval.signal.bw"
+                   #ATAC = "/mnt/orca/damir/DanRer_ATAC-seq/pipeline_out/atac_48h/signal/macs2/pooled_rep/ATAC_48hpf_rep1.R1.PE2SE.nodup.tn5_ATAC_48hpf_rep2.R1.PE2SE.nodup.tn5.pf.pval.signal.bigwig"
+                   )
+    )
+)
+
+sp.damir.L <- fishPlotInputs %>% map(function(stage) {
+    imap(stage$assayFiles, function(bw, modN) {
+        ScoreMatrixFromBigWig(bw, promDominant)
+        #modN
+    }) 
+})%>% unlist(recursive = F)
+
+```
+
+```{r fig.height=6, fig.width=10}
+plotAggregatedCageBothStrands(km = krL.prim5[["0.006"]],
+                              prom = promDominant, trimEdgesBp=00, 
+                              xlab="position relative to the dominant post-MBT TSS",
+                              ylab="CAGE expression [average TPM]", 
+                              sm.cageFw = sp.cagePostMbtFwNoLog,
+                              ylab2 = "ATAC [average cuts per million]",
+                              sm.cageRev = sp.cagePostMbtRevNoLog, sm.atacDome = sp.atac.dome,
+                              sm.atacPrim5 = sp.atac.prim5,
+                              classNames = c("double NFR", "medium zygotic", "narrow", "wide",
+                                             "medium constitutive", "upstream offset", "weak open", "strong open"))
+```
+
+```{r fig.height=6, fig.width=10}
+plotAggregatedCageBothStrands(km = krL.prim5[["0.006"]],
+                              prom = promDominant, trimEdgesBp=00, xlab="position relative to the dominant post-MBT TSS",
+                              ylab="CAGE expression [average TPM]", sm.cageFw = sp.cagePostMbtFwNoLog,
+                              ylab2 = "ATAC [average cuts per million]",
+                              sm.cageRev = sp.cagePostMbtRevNoLog, sm.atacDome = sp.atac.dome,
+                              sm.atacPrim5 = sp.atac.prim5,
+                              classNames = c("double NFR", "medium zygotic", "narrow", "wide",
+                                             "medium constitutive", "upstream offset", "weak open", "strong open"))
+```
+
+Figure 4 for the paper. 
+heatmap, rank by expression; 	individual per class
+```{r}
+tibble(clu = krL.prim5[["0.006"]]$cluster) %>% 
+    mutate(promI = row_number()) %>%
+    #, consensus.cluster = promDominant[promI]$consensus.cluster) %>%
+    group_by(clu) %>%
+    summarise(promIL = list(promI)) %>%
+    pull(promIL) %>%
+    # list of promDominant indices per each ATAC cluster; list length 8
+    #head(2) %>% # REMOVEME
+    map(function(promI)
+    {
+        tibble(promI = promI, 
+               postMbtItsConsensusClusterMeanExpr = promDominant[promI]$postMbtItsConsensusClusterMeanExpr,
+               postMbtItsConsensusClusterMaxExpr  = promDominant[promI]$postMbtItsConsensusClusterMaxExpr) %>%
+            arrange(desc(postMbtItsConsensusClusterMeanExpr)) %>%
+            pull(promI) 
+    }) %>%
+    ## list of length 8 of promoter indices 
+    `names<-`(c("double NFR", "medium zygotic", "narrow", "wide",
+                "medium constitutive", "upstream offset", "weak open", "strong open")) %>%
+    {.[c(6, 1, 4, 8, 2, 3, 5, 7)]} %>%  # permute
+    (function(promIL)
+    {
+        # plotting of ATAC:
+        # list of ordered scoring matrices of ATAC to be plotted
+        hmL <- map(promIL, function(promI)
+        {
+            promI %>% `[`(sp.atac.prim5, .) %>%
+                `+`(0.006) %>% log2() %>% `-`(log2(0.006)) %>%
+                smoothScoreMatrixFilter2(kernGenerator(1,10))
+        })
+        
+        pdf("heatmap.atacPrim5.byKrL.prim5.0.006.orderByMeanExpr.smooth.pdf", 3, 6)
+        # unmodified heatmap:
+        thisSm <- do.call(hmL, what = rbind) %>% as("ScoreMatrix")
+        # or interspersed with empty rows:
+        interspersedSm <- rep(list(matrix(0, nrow = 1800, ncol = 1600)), 8*2-1)
+        interspersedSm[((1:8)-1) * 2 + 1] <- hmL
+        interspersedSm <- do.call(interspersedSm, what = rbind) %>% as("ScoreMatrix")
+
+        heatMatrix(interspersedSm,
+                   #group = hmL %>% imap(~rep(.y, dim(.x)[1])) %>% unlist() %>% as.factor(),
+                   winsorize = c(0,99.5),
+                   xcoords = c(-800, 800),
+                   xlab = "position with respect to the strongest post-MBT TSS",
+                   cex.legend = 0.7,
+                   cex.lab = 0.7,
+                   cex.axis = 0.7,
+                   col = colorRampPalette(c("white", "midnightblue"))(255))
+        dev.off()
+        
+        # plotting of CAGE
+        cageL <- map(promIL, function(promI)
+        {
+            promI %>% `[`(sp.cagePostMbtFwNoLog, .) #sp.cagePostMbtFwNoLog
+        })
+        pdf("heatmap.postMbtCAGE.byKrL.orderByMeanExpr.pdf", 9, 6)
+        heatMatrix(do.call(what = rbind, cageL) %>% as("ScoreMatrix") %>% smoothHeatmatrixRows(kern.n1),
+                   group = cageL %>% imap(~rep(.y, dim(.x)[1])) %>% unlist() %>% as.factor(),
+                   winsorize = c(0,99.5),
+                   xcoords = c(-800, 800),
+                   xlab = "position with respect to the strongest post-MBT TSS",
+                   cex.legend = 0.7,
+                   cex.lab = 0.7,
+                   cex.axis = 0.7,
+                   col = colorRampPalette(c("white", "darkred"))(255))
+        dev.off()
+        
+        cageMinusL <- map(promIL, function(promI)
+        {
+            promI %>% `[`(sp.cagePostMbtRevNoLog, .)
+        })
+        pdf("heatmap.postMbtCAGEminus.byKrL.orderByMeanExpr.pdf", 9, 6)
+        heatMatrix(do.call(what = rbind, cageMinusL) %>% as("ScoreMatrix") %>% smoothHeatmatrixRows(kern.n1),
+                   group = cageMinusL %>% imap(~rep(.y, dim(.x)[1])) %>% unlist() %>% as.factor(),
+                   winsorize = c(0,99.5),
+                   xcoords = c(-800, 800),
+                   xlab = "position with respect to the strongest post-MBT TSS",
+                   cex.legend = 0.7,
+                   cex.lab = 0.7,
+                   cex.axis = 0.7,
+                   col = colorRampPalette(c("white", "darkred"))(255))
+        dev.off()
+        
+    })
+```
+
+Figure 4 for the paper. 
+heatmap, rank by expression;
+added mononucleosome
+
+```{r}
+promIbyClassAndExpression <- 
+    tibble(clu = krL.prim5[["0.006"]]$cluster) %>% 
+    mutate(promI = row_number()) %>%
+    group_by(clu) %>%
+    summarise(promIL = list(promI)) %>%
+    pull(promIL) %>%
+    # list of promDominant indices per each ATAC cluster; list length 8
+    map(function(promI)
+    {
+        tibble(promI = promI, 
+               postMbtItsConsensusClusterMeanExpr = promDominant[promI]$postMbtItsConsensusClusterMeanExpr,
+               postMbtItsConsensusClusterMaxExpr  = promDominant[promI]$postMbtItsConsensusClusterMaxExpr,
+               #iqw = promDominant[promI]$  TODO
+                   ) %>%
+            arrange(desc(postMbtItsConsensusClusterMeanExpr))
+    }) %>%
+    `names<-`(c("double NFR", "medium zygotic", "narrow", "wide",
+                "medium constitutive", "upstream offset", "weak open", "strong open")) %>%
+    {.[c(6, 1, 4, 8, 2, 3, 5, 7)]}   # permute
+
+# conservation heatmap production:
+pdf("heatmap.atacPrim5.byKrL.vertConservation-200+100.n5.pdf", 4, 6)
+phastV <- sp.phastVert[, 600:900] %>% 
+    rowMeans() %>% 
+    matrix(., nrow = length(.))
+phastL <- promIbyClassAndExpression %>%
+    map(~phastV[pull(., "promI")]) %>%
+    map(~matrix(., ncol = 1)) %>%     # there is a bug in fftw2d, so these transpositions are a hack:
+    map(~EBImage::filter2(t(.), filter = t(matrix(kern.n5, ncol=1)), boundary="replicate")) %>%
+    map(~matrix(., ncol = 1))
+interspersedPhastV <- rep(list(matrix(0, nrow = 1800, ncol = 1)), 8*2-1)
+interspersedPhastV[((1:8)-1) * 2 + 1] <- phastL
+
+do.call(interspersedPhastV, what = rbind) %>% as("ScoreMatrix") %>%
+        heatMatrix(cex.legend = 0.7,
+                   cex.lab = 0.7,
+                   cex.axis = 0.7,
+                   col = colorRampPalette(c("white", "darkgreen"))(255)
+        )
+
+dev.off()
+
+# expression heatmap production:
+pdf("heatmap.atacPrim5.byKrL.prim5.Expression-2.pdf", 4, 6)
+exprL <- promIbyClassAndExpression %>%
+    map(~pull(., postMbtItsConsensusClusterMeanExpr)) %>%
+    map(~matrix(., ncol = 1)) %>%
+    map(~.+1) %>% map(log2) %>% map(~.-log2(1))
+
+    interspersedExpr <- rep(list(matrix(0, nrow = 1800, ncol = 1)), 8*2-1)
+    interspersedExpr[((1:8)-1) * 2 + 1] <- exprL
+    
+    do.call(interspersedExpr, what = rbind) %>% as("ScoreMatrix") %>%
+        heatMatrix(      # winsorize = c(0.5, 99.5),
+                   #xcoords = c(-800, 800),
+                   #xlab = "position with respect to the strongest post-MBT TSS",
+                   cex.legend = 0.7,
+                   cex.lab = 0.7,
+                   cex.axis = 0.7,
+                   col = colorRampPalette(c("white", "darkred"))(255)
+        )
+dev.off()
+
+    # ATAC heatmap production:
+promIbyClassAndExpression %>%
+    map(~pull(., promI)) %>%
+    ## list of length 8 of promoter indices 
+    
+    (function(promIL)
+    {
+        # plotting of ATAC:
+        # list of ordered scoring matrices of ATAC to be plotted
+        hmL <- map(promIL, function(promI)
+        {
+            promI %>% `[`(sp.atac.prim5, .) %>%
+                `+`(0.006) %>% log2() %>% `-`(log2(0.006)) %>%
+                smoothScoreMatrixFilter2(kernGenerator(1,10)) %>%
+                `[`(, 100:1400)
+        })
+        
+        # mononucleosome fraction:
+        monoNucL <- map(promIL, function(promI)
+        {
+            # 0.001 not good. 0.006 better. 0.1 looks good. 1.0 probably too much
+            promI %>% `[`(sp.monoNucAtac.prim5.wid100, .) %>%
+                `+`(0.1) %>% log2() %>% `-`(log2(0.1)) %>%
+                smoothScoreMatrixFilter2(kernGenerator(1,10)) %>%
+                `[`(, 100:1400)
+            
+            #promI %>% `[`(sp.nonoNucAtac.prim5, .) %>%
+            #    `+`(0.006) %>% log2() %>% `-`(log2(0.006)) # THE PSEUDOCOUNT WAS NOT CHOSEN, copied
+        })
+        
+        
+        # unmodified heatmap:
+        thisSm <- do.call(hmL, what = rbind) %>% as("ScoreMatrix")
+        monoNucSm <- do.call(monoNucL, what=rbind) %>% as("ScoreMatrix")
+        
+        # or interspersed with empty rows:
+        interspersedSm <- rep(list(matrix(0, nrow = 1800, ncol = 1301)), 8*2-1)
+        interspersedSm[((1:8)-1) * 2 + 1] <- hmL
+        interspersedSm <- do.call(interspersedSm, what = rbind) %>% as("ScoreMatrix")
+
+        interspersedMononucSm <- rep(list(matrix(0, nrow = 1800, ncol = 1301)), 8*2-1)
+        interspersedMononucSm[((1:8)-1) * 2 + 1] <- monoNucL
+        interspersedMononucSm <- do.call(interspersedMononucSm, what = rbind) %>% as("ScoreMatrix")
+        
+        sml = as(list(interspersedSm, interspersedMononucSm), "ScoreMatrixList")
+        
+        if(T)
+        {
+        pdf("heatmap.atacPrim5.byKrL.prim5.0.006.orderByMeanExpr.monoNuclosome2.pdf", 8, 6)
+        multiHeatMatrix(sml, 
+                   matrix.main = c("accessibility", "mono-nucleosome"),
+                   winsorize = c(0,99.5),
+                   xcoords = c(-700, 600),
+                   xlab = "position with respect to the strongest post-MBT TSS",
+                   cex.legend = 0.7,
+                   cex.lab = 0.7,
+                   cex.axis = 0.7,
+                   col = colorRampPalette(c("white", "darkred"))(255))  #midnightblue
+        dev.off()
+        }
+        
+        pdf("heatmap.atacPrim5.byKrL.prim5.0.006.orderByMeanExpr.differential2.pdf", 3, 6)
+        heatMatrix(interspersedSm - interspersedMononucSm * 6.4 / 12,
+                   winsorize = c(0.5, 99.5),
+                   xcoords = c(-700, 600),
+                   xlab = "position with respect to the strongest post-MBT TSS",
+                   cex.legend = 0.7,
+                   cex.lab = 0.7,
+                   cex.axis = 0.7,
+                   col = colorRampPalette(c("midnightblue", "white", "darkred"))(255)
+        )
+        dev.off()
+        
+        
+        # plotting of CAGE
+        # removed (see the part above)
+    })
+```
+
+
+
+```{r fig.height=8, fig.width=12}
+list(
+    list(sp.atac.oblong, kern.n2, "ATAC oblong"),
+    list(sp.atac.dome, kern.n2, "ATAC dome"),
+    list(sp.atac.prim5, kern.n2,   "ATAC prim5"),
+    list(sp.atac.longPec, kern.n2,   "ATAC longPec"),
+    
+    list(sp.nonoNucAtac.oblong, 0, "ATAC oblong mononucleosome"),
+    list(sp.nonoNucAtac.prim5, 0, "ATAC prim5 mononucleosome"),
+    list(sp.monoNucAtac.prim5.kernn50, 0, "ATAC prim5 mononucleosome kern.n50"),
+    list(sp.monoNucAtac.prim5.wid150, 0, "ATAC prim5 mononucleosome wid=150"),
+    list(sp.nucFreeAtac.prim5, 0, "ATAC prim5 nucleosome-free"),
+    list(sp.diNucAtac.prim5, 0,   "ATAC prim5 dinucleosome" ),
+
+    list(sp.cagePostMbtFwNoLog, kern.n1, "post-MBT CAGE"),
+    list(sp.cagePostMbtRevNoLog, kern.n3, "post-MBT CAGE reverse orientation"),
+    list(sp.cagePreMbtFwNoLog,  kern.n1, "pre-MBT (aka oocyte) CAGE"),
+    list(sp.cagePreMbtRevNoLog, kern.n3, "pre-MBT (aka oocyte) CAGE reverse orientation"),
+    list(sp.gc, kern.n3, "GC content"),
+    list(sp.cpg, kern.n3, "CpG content"),
+    list(sp.wwPlus, kern.n1, "WW+"),
+    list(sp.wwwwwPlus, kern.n1, "WWWWW+"),
+    list(sp.TATAWAWR, kern.n2, "TATAWAWR"),
+    list(sp.TATAWAWR.rev, kern.n2, "revCompl(TATAWAWR)"),
+    list(sp.MteOhlerConsens, kern.n2, "MTE Ohler"),
+    list(sp.CCAT, kern.n5, "CCAT"),
+    list(sp.YC, kern.n1, "YC"),
+    list(sp.YR, kern.n1, "YR"),
+    list(sp.purine, kern.n1, "R"),
+    list(sp.purineX2, kern.n1, "RR"),
+    list(sp.purineX4, kern.n1, "RRRR"),
+    list(sp.GA, 0, "GA"),
+    list(sp.AA, 0, "AA"),
+    list(sp.GG, 0, "GG"),
+    list(sp.AG, 0, "AG"),
+    list(sp.CTCFplusConsens, kern.n1, "CTCF consensus +"),
+    list(sp.CTCFminusConsens, kern.n1, "CTCF consensus -"),
+    list(sp.REST, kern.n3, "REST"),
+    list(sp.SP1, kern.n3, "SP1"),
+    list(sp.ELK, kern.n5, "ELK"),
+    list(sp.grbTarget, 0, "GRB target percentage"),
+    list(sp.phastFish, 0, "conservation, fish"),
+    list(sp.phastVert, 0, "conservation, vertebrates"),
+    list(sp.phylopVert,kern.n2, "phyloP, vertebrates"),
+    list(sp.cds, 0, "CDS"),
+    list(sp.cdsStart, kern.n5, "CDS start"),
+    list(sp.intron, 0, "Intron"),
+    list(sp.transcriptReduced, 0, "Transcript (reduced granges)"),
+    list(sp.transcriptAntisenseReduced, 0, "Antisense Transcript (reduced granges)"),
+    list(sp.firstExons, 0, "First exons (same orientation)"),
+    list(sp.methJiaRing, kern.n3, "DNA methylation (Jia, ring)"),
+    list(sp.h2az, 0, "H2AFV"),
+    list(sp.damir.L$prim5.H3K27ac, 0, "H3K27ac Damir"),
+    list(sp.damir.L$prim5.H3K4me1, 0, "H3K4me1 Damir"),
+    list(sp.damir.L$prim5.H3K4me3, 0, "H3K4me3 Damir")
+    ) %>% reduce(rbind) %>% 
+        apply(2, identity) %>%
+        plotMultiAggr(plottingConf=.,
+                      clus=km2clus(krL.prim5[["0.006"]],prom=promDominant),
+                      prom=promDominant,
+                      trimEdgesBp=50,
+                      zeroAt=801,
+                      zeroDesc="strongest TSS post-MBT",
+                      classNames = c("double NFR", "medium zygotic", "narrow", "wide",
+                                     "medium constitutive", "upstream offset", "weak open", "strong open")
+        )
+```
+
+```{r}
+
+k27me3 <- c(dome = "ChIP-seq_Skarmeta_Lab_H3K27me3_0002AS.DCD000631SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bw",
+           Epi75 = "ChIP-seq_Schier_Lab_H3K37me3_0001AS.DCD003123SQ.USERdanio-user.R1.merged.bw",
+           Som8 = "Som-K27me3_S10_L001_R1_001.merged.nodup.bw",
+           prim5 = "ChIP-seq_Skarmeta_Lab_H3K27me3_0002AS.DCD000632SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bw",
+           longPec = "ChIP-seq_Skarmeta_Lab_H3K27me3_0002AS.DCD000630SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bw") %>%
+    {set_names(paste0("http://trackhub.genereg.net/DANIO-CODE/danRer10/", .), names(.))}
+
+
+
+preMZT_K27me3 <- list.files("/mnt/storage/Damir/preMZT_K27me3/", pattern = "bigwig", full.names = T)
+preMZT_K27me3 <- preMZT_K27me3[c(2, 3, 1)]
+names(preMZT_K27me3) <- c("c16", "c64", "c128")
+k27me3Url <- paste0("http://trackhub.genereg.net/DANIO-CODE/danRer10/", k27me3)
+#k27me3Url <- c(k27me3, preMZT_K27me3, k27me3Url)
+
+sp.damir.H3K27me3.L <- c(k27me3, preMZT_K27me3) %>% 
+    map(~ScoreMatrixBinFromBigWig(., promDominant+5200, bin.num = 600)) %>%  #-6000 +6000
+    `names<-`(paste0(names(.), ".H3K27me3"))
+       
+#ScoreMatrixFromBigWig(fishPlotInputs$prim5$assayFiles["H3K4me3"], promDominant)
+#/mnt/storage/Damir/ChromHMM/Prim-5/ChIP-seq_Skarmeta_Lab_H3K27me3_0002AS.DCD000632SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bw
+#/mnt/storage/Damir/ChromHMM/Prim-5/ChIP-seq_Skarmeta_Lab_H3K27me3_0002AS.DCD000631SQ.USERpanosfirbas.R1.filt.deduplicated.nodup.bw
+```
+
+```{r fig.height=8, fig.width=12}
+restrictRegions <- function(reg, extension, value=F)
+{
+    goodI <- (reg+extension) == trim(reg+extension)
+    if(value)
+        (reg+extension)[goodI]
+    else
+        goodI
+}
+
+
+restrictClustering <- function(km, regI)
+{
+    # warning it removes regions only from the clustering vector. Does not update any other fields.
+    km$cluster <- km$cluster[regI]
+    km
+}
+
+
+c(#sp.damir.L,
+  sp.damir.H3K27me3.L) %>%
+    imap( ~ list(.x, 0, .y)) %>%
+    reduce(rbind) %>%
+    apply(2, identity) %>%
+    plotMultiAggr(
+        plottingConf = .,
+        clus = km2clus(restrictClustering(krL.prim5[["0.006"]], regI = restrictRegions(promDominant, 5200)),
+                                          prom = restrictRegionsI(promDominant, 5200, value = T)),
+        prom = restrictRegionsI(promDominant, 5200, value=T),
+        trimEdgesBp = 0,
+        zeroAt = 301,
+        zeroDesc = "strongest TSS post-MBT, binned (-6000 to +6000 bp), xtics at bin numbers",
+        classNames = c(
+            "double NFR",
+            "medium zygotic",
+            "narrow",
+            "wide",
+            "medium constitutive",
+            "upstream offset",
+            "weak open",
+            "strong open"
+        )
+    )
+```
+
+
+
+
+Compare pre and post-MBT CAGE in each class 
+
+```{r}
+plotAggregatedCageBothStrands2 <- function(km=koL.dome[[8]], prom=promDominantFlt, 
+                                          trimEdgesBp=50, zeroAt=800, xlab="", ylab2="",
+                                          ylab="", classNames=NULL,
+                                          smL)
+{
+    xWid <- dim(smL[[1]])[2]
+    smL <- map(smL, function(sm)
+    {
+        clus2phastCons(km2clus(km, prom=prom), prom,
+                       sm, smoothW=kern.n1)
+    })
+    
+    nClus <- length(smL[[1]])
+    
+    map(1:nClus, function(clusI)
+    {
+        par(mar=c(5.1, 4.1, 4.1, 4.1))
+        y <- map(smL, `[[`, clusI) %>%
+            reduce(cbind) %>% 
+            `[`((1+trimEdgesBp):(xWid-trimEdgesBp), ) * 10e6
+        
+        matplot(x=(1-zeroAt+trimEdgesBp):(xWid-trimEdgesBp-zeroAt), 
+                y=y ,
+                type="l", ylab=ylab, 
+                xlab=xlab, axes=F, lwd=1.5, 
+                lty=1,
+                #col=1:8, lty=rep(1:3, each=8),
+                main=ifelse(is.null(classNames), paste("class", clusI), classNames[clusI]),
+                #ylim=c(0, max(fw)*0.8 * 10e6)
+                )  # heuristics
+        axis(1, at=seq(-800, 800, 100), col.axis="black", las=2)
+        axis(2)
+        abline(v=seq(-800, 800, 100), col="lightgray", lty="dotted", lwd=1)
+        abline(h=0, col="gray")
+        abline(v=0, col="gray")
+        
+    })
+    
+        
+        
+        #legend("topright", legend=1:length(clus), col=1:8, lty=rep(1:3, each=8), lwd = 1.5)
+        
+        # par(new=TRUE, mar=c(5.1, 4.1, 4.1, 4.1))
+        # matplot(x=(1-zeroAt+trimEdgesBp):(xWid-trimEdgesBp-zeroAt),
+        #      y=cbind(a1, a2), #, a3, a4
+        #      type="l", col=c("lightblue", "lightgreen", "purple", "lightgreen"), lty=1,
+        #      xlab="", ylab="", axes=F)
+        # axis(4)
+        # mtext(ylab2, side=4, line=3)
+        # legend("topleft", legend = c("forward CAGE", "reverse CAGE"), lwd=1.5, col=1:2)
+        # legend("topright", legend = c("dome ATAC", "prim 5 ATAC"), lwd=1.5,
+        #                               col=c("lightblue", "lightgreen"))
+    #invisible(0)
+}
+```
+
+```{r fig.height=6, fig.width=10}
+plotAggregatedCageBothStrands2(km = krL.prim5[["0.006"]],
+                              prom = promDominant, trimEdgesBp=00, xlab="position relative to the dominant post-MBT TSS",
+                              ylab =  "CAGE post-MBT expression [average TPM]",
+                              ylab2 = "CAGE pre-MBT",
+                              smL = list(sp.cagePostMbtFwNoLog, sp.cagePostMbtRevNoLog, sp.cagePreMbtFwNoLog, sp.cagePreMbtRevNoLog),
+                              classNames = c("double NFR", "medium zygotic", "narrow", "wide",
+                                             "medium constitutive", "upstream offset", "weak open", "strong open"))
+```
+
+colour scheme:
+1_TssA1 2_TssA2 3_TssFlank1 4_TssFlank2 5_EnhA1 6_EnhFlank 7_EnhWk1 8_Pois 9_ReprPC 10_Quies
+"#A6CEE3" "#1F78B4" "#33A02C" "#B2DF8A" "#E31A1C" "#FB9A99" "#FF7F00" "#6A3D9A" "#CAB2D6" "#A1A2A3"
+"#FFFF99" "#B15928"
+
+```{r}
+kernGenerator <- function(xSd, ySd) 
+{
+    xSd <- round(xSd)
+    ySd <- round(ySd)
+    # to be used with smoothScoreMatrixFilter2
+    expand.grid(s.1 = seq(-3*xSd, 3*xSd, length.out=1+6*xSd),
+                s.2 = seq(-3*ySd, 3*ySd, length.out=1+6*ySd)) %>% 
+        mvtnorm::dmvnorm(x = ., mean = c(0, 0), sigma = diag(c(xSd,ySd))) %>%
+        matrix(nrow = 1+6*xSd, ncol = 1+6*ySd, byrow = FALSE) %>%
+        t() %>%
+        {./sum(.)}
+}
+kern.n1r1 <- kernGenerator(1,1)
+kern.n1r2 <- kernGenerator(1,2)
+
+smoothScoreMatrixFilter2 <- function(sm, kern)
+{
+    EBImage::filter2(sm, kern, boundary = "replicate")
+}
+```
+
+```{r}
+exonsByTx <- exonsBy(txDb, "tx") %>% # on negative strand this is ordered from right to left, correctly
+    as.list()
+    
+firstExons <- exonsByTx %>%
+    map(`[`, 1) %>% 
+    as("GRangesList") %>% 
+    unlist()
+
+```
+
+```{r}
+
+ScoreMatrixPiotr <- function(target, windows, ignore.strand=FALSE)
+{
+    stopifnot(max(width(windows)) == min(width(windows)))
+    summariseOneRow <- function(target, window)
+    {
+        as.numeric(append(coverage(ranges(target)), Rle(0L, 1000000000))[ranges(window)])
+    }
+    ret <- matrix(0, ncol = length(windows), nrow=width(windows[1])) # this will be transposed
+    o <- findOverlaps(target, windows, ignore.strand=ignore.strand) %>%
+        as_tibble() %>%
+        group_by(subjectHits) %>%
+        summarise(data=list(summariseOneRow(target[queryHits], windows[subjectHits[1]])))
+    rowI <- pull(o, subjectHits)
+    data <- pull(o, data)
+    strands <- strand(windows) %>% as.vector()
+    for(i in seq_along(rowI))
+    {
+        if(strands[rowI[i]] == "-")
+            ret[ , rowI[i]] <- rev(data[i][[1]])
+        else
+            ret[ , rowI[i]] <- data[i][[1]]
+    }
+    t(ret)
+}
+```
+
+
+
+```{r paged.print=TRUE}
+go <- clus2topGo(km2clus(krL.prim5[["0.006"]], 
+                   prom=promDominant, 
+                   names = c("double NFR", "medium zygotic", "narrow", "wide",
+                             "medium constitutive", "upstream offset", "weak open",
+                             "strong open")), 
+           promDominant, nTop = 50)
+go
+
+library(openxlsx)
+go %>% write.xlsx("go.xlsx")
+```
+
+
+Make a flow chart between dome and prim5.
+```{r fig.height=5, fig.width=7}
+sp.atac.dome.smoothed <- smoothHeatmatrixRows(sp.atac.dome, kern.n3) %>%
+    (function(sm) { log2(sm + 0.006) - log2(0.006) })
+centroids.provisoric <- tibble(clusI = krL.prim5[["0.006"]]$cluster, b = seq_along(krL.prim5[["0.006"]]$cluster)) %>%
+    group_by(clusI) %>% 
+    summarise(I = list(b)) %>%
+    pull(I) %>%
+    map(function(I)
+    {
+        sp.atac.dome.smoothed[I, ] %>% colMeans()
+    })
+krL.dome <- kmeans(sp.atac.dome.smoothed, iter.max=120, centers=centroids.provisoric %>% do.call(what=rbind))
+```
+
+```{r fig.height=5, fig.width=9}
+# old centers:
+matplot(x = (-800:799), y= krL.prim5[["0.006"]]$centers %>% t(), type = 'l', ylab='', main="prim5 (original)")
+# centers maped to dome
+centroids.provisoric %>% do.call(what=cbind) %>% matplot(x = (-800:799), type='l', ylab='', main="dome (mapped from prim5)")
+# k-means optimised centres at dome
+matplot(x = (-800:799), y= krL.dome$centers %>% t(), type = 'l', ylab='', main="dome (optimised)")
+```
+
+Now flow diagram
+```{r fig.height=12, fig.width=12}
+library(networkD3)
+links2 <- tibble(domeC=krL.dome$cluster, prim5C=krL.prim5[["0.006"]]$cluster, one=1) %>%
+                  group_by(domeC, prim5C) %>% 
+                  summarise(num=length(one))
+links2$domeC  <- links2$domeC-1;
+links2$prim5C <- links2$prim5C+8-1;
+atacClassN <- c("double NFR", "medium zygotic", "narrow", "wide",
+            "medium constitutive", "upstream offset", 
+             "weak open", "strong open")
+nodes <- data.frame(name=c(paste("dome", atacClassN), paste("prim5", atacClassN)))
+
+sankeyCol <- 'd3.scaleOrdinal() .domain(["group_A", "group_B","group_C", "group_D", "group_E", "group_F", "group_G", "group_H"]) .range(["blue", "blue" , "blue", "red", "red", "yellow", "purple", "purple"])'
+
+sankeyNetwork(Links = links2, Source = "domeC", Target = 'prim5C', Value = "num",
+              Nodes = nodes, NodeID = "name", unit="proms", colourScale = sankeyCol,
+              fontSize = 12, nodeWidth = 30, height = 600, width = 1000)
+```
+
+```{r fig.height=6, fig.width=6}
+nodes4 <- data.frame(ID=c(paste("dome", atacClassN), paste("prim5", atacClassN)),
+                     x = c(1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2),
+                     #y = rep(c(4,8,1,7,3,6,5,2), 2),
+                     y = rep(9-c(2,5,6,3,7,1,8,4) %>%
+                                 `+`(c(-0.4, -1.2, -1.1, -0.8,
+                                       -0.8, 0, -0.15, -1.2)),
+                             2),
+                     #y = c(1,2,3,4,5,6,7,8,1,2,3,4,5,6,7,8),
+                     labels = rep("", 16))
+edges4 <- data.frame(N1 = nodes4$ID[links2$domeC+1],
+                     N2 = nodes4$ID[links2$prim5C+1],
+                     Value = links2$num)
+#cols4  <- 1:8   # need to check with fig3 by Ferenc
+#cols4 <- c("#A6CEE366", "#1F78B466", "#33A02C66", "#B2DF8A66", "#E31A1C66", "#FB9A9966", "#FF7F0066", "#6A3D9A66")  # test
+cols4 <- c("upstream offset" = "#d63fc8",
+           "double NFR" = "#1f2321", 
+           "wide" = "#57afed", 
+           "strong open" = "#bab8ba", 
+           "medium zygotic" = "#e4697f", 
+           "narrow" = "#87d879",
+           "medium constitutive" = "#55e6e9", 
+           "weak open" = "#f6d240")
+styles4 <- map2(nodes4$ID, rep(paste0(cols4[atacClassN], 99), 2),
+                function(n, cc) 
+                    list(col=cc)) %>% 
+    `names<-`(nodes4$ID)
+pdf("riverplot.pdf", 7, 5)
+plot(makeRiver(nodes4, edges4, styles = styles4), plot_area=1, nodewidth=4)
+dev.off()
+```
+
+
+
+inner product between ATAC profiles at dome and prim5. Only diagonal terms (the same promoter). Or actually pearson's correlation better than inner product. Or L2 distance. No distance makes no sense, because it is not the same experiment.
+```{r}
+cor(t(sp.atac.dome.smoothed[1:3, ]), t(smoothHeatmatrixRows(sp.atac.prim5, kern.n3)[1:3, ]))
+
+splitMatrixByRow <- function(x) lapply(seq_len(nrow(x)), function(i) x[i, ])
+cor.dome.prim5 <- map2(.x = splitMatrixByRow(sp.atac.dome.smoothed@.Data),
+     .y = splitMatrixByRow(smoothHeatmatrixRows(sp.atac.prim5, kern.n3)@.Data),
+     .f = function(a, b)
+     {
+       cor(a,b)  
+     }) %>% do.call(what=c)
+
+```
+
+
+Damir's PDRE
+```{r}
+# dependency: PDREs
+pdre <- readRDS("/mnt/storage/DANIO-CODE/pdre_distal_SOM_ChromHMM_annotation.RDS")
+head(pdre)
+```
+score column is always zero
+```{r}
+pdre %>% mcols() %>% `[[`("SOM_class") %>% table()   # 16 classes
+pdre %>% mcols() %>% `[[`("Prim5") %>% table()       # 10 types
+```
+
+```{r}
+plotSmoothMetaMatrix <- function(smL, x=1:(dim(smL[[1]])[2]), ylim, 
+                                 col=rainbow(length(smL)), main="", lty=rep(1, length(smL)))
+{
+    plot(x, rep(0, length(x)), ylim=ylim, type="n", xlab="", ylab="", main=main)
+    pmap(list(smL %>% map(colMeans), col=col, lty=lty), function(y, col, lty)
+    {
+        lo <- loess(y~x, span = 0.2)
+        v <- predict(lo, x)
+        lines(x, v, col=col, lty=lty)
+        v
+    })
+}
+```
+
+```{r fig.height=7, fig.width=12}
+promIbyClassAndExpression %>% 
+    map(~pull(., promI)) %>% 
+    map(~promDominant[.]) %>%
+    map(function(prom)
+    {
+        ScoreMatrixBin(pdre[pdre$Prim5 %in% c("5_EnhA1")] %>% resize(width = 1, fix = "center"),
+                       prom+50250, strand.aware = T, bin.op = "sum", bin.num=101)
+    }) -> tmp
+# ScoreMatrixBin treats each target GRanges as number of bases covered in a bin, so bin.op=sum would sum up covered bases. I resized pdre to make sure they are counted once.
+ScoreMatrixBin(c(GRanges("a:30-40"), GRanges("a:500-510")), GRanges("a:1-100"), bin.num = 10, bin.op="max")@.Data
+
+#tmp %>% map(colMeans) %>% do.call(what=cbind) %>% 
+#    matplot(type="n", x = seq(-50000, 50000, by=1000), xlab="position wrt promoter",
+#            main = "EnhA1 density", ylab="", lwd=2)
+# smooth by loess:
+plotSmoothMetaMatrix(tmp, x = seq(-50000, 50000, by=1000), ylim=c(0, 0.03), main = "EnhA1 density")
+legend("topleft", legend = names(promIbyClassAndExpression), lty=1, col=rainbow(8))
+```
+
+```{r fig.height=7, fig.width=12}
+promIbyClassAndExpression %>% 
+    map(~pull(., promI)) %>% 
+    map(~promDominant[.]) %>%
+    map(function(prom)
+    {
+        ScoreMatrixBin(pdre[pdre$Prim5 %in% c("7_EnhWk1")] %>% resize(width = 1, fix = "center"),
+                       prom+50250, strand.aware = T, bin.op = "sum", bin.num=101)
+    }) -> tmp2
+plotSmoothMetaMatrix(tmp2, x = seq(-50000, 50000, by=1000), ylim=c(0, 0.04), main = "EnhWk1 density")
+
+#tmp2 %>% map(colMeans) %>% do.call(what=cbind) %>% 
+#    matplot(type="l", x = seq(-50000, 50000, by=1000), xlab="position wrt promoter",
+#            main = "EnhWk1 density", ylab="", lwd=2)
+legend("topleft", legend = names(promIbyClassAndExpression), lty=1, col=rainbow(8))
+
+```
+
+```{r fig.height=7, fig.width=12}
+promIbyClassAndExpression %>% 
+    map(~pull(., promI)) %>% 
+    map(~promDominant[.]) %>%
+    map(function(prom)
+    {
+        ScoreMatrixBin(pdre[pdre$Prim5 %in% c("8_Pois")] %>% resize(width = 1, fix = "center"),
+                       prom+50250, strand.aware = T, bin.op = "sum", bin.num=101)
+    }) %>% 
+    plotSmoothMetaMatrix(x = seq(-50000, 50000, by=1000), ylim=c(0, 0.02), main = "Poised element density")
+
+    
+#    map(colMeans) %>% do.call(what=cbind) %>% 
+#    matplot(type="l", x = seq(-50000, 50000, by=1000), xlab="position wrt promoter",
+#            main = "Poised elements density", ylab="", lwd=2)
+legend("topleft", legend = names(promIbyClassAndExpression), lty=1:5, col=1:6)
+```
+
+```{r fig.height=7, fig.width=12}
+promIbyClassAndExpression %>% 
+    map(~pull(., promI)) %>% 
+    map(~promDominant[.]) %>%
+    map(function(prom)
+    {
+        ScoreMatrixBin(pdre[pdre$Prim5 %in% c("9_ReprPC")] %>% resize(width = 1, fix = "center"),
+                       prom+50250, strand.aware = T, bin.op = "sum", bin.num=101)
+    }) %>% map(colMeans) %>% do.call(what=cbind) %>% 
+    matplot(type="l", x = seq(-50000, 50000, by=1000), xlab="position wrt promoter",
+            main = "ReprPC elements density", ylab="", lwd=2)
+legend("topleft", legend = names(promIbyClassAndExpression), lty=1:5, col=1:6)
+```
+
+# bug to report: tibble grouped by a complex number throws an error on summarise
+```{r fig.height=7, fig.width=12}
+promDominantBySom <- tibble(som = consClusKm[promDominant$consensus.cluster %>% as.character()]$som.s7) %>%
+    mutate(promI = row_number()) %>% 
+    mutate(som = as.character(som)) %>%
+    group_by(som) %>%
+    summarise(l=list(promI)) %>%
+    #column_to_rownames(var = "som") %>%
+    pull(l, name = som) %>%
+    map(~promDominant[.])
+
+promDominantBySom %>% map(function(prom)
+    {
+        ScoreMatrixBin(pdre[pdre$Prim5 %in% c("5_EnhA1")] %>% resize(width = 1, fix = "center"),
+                       prom+50250, strand.aware = T, bin.op = "sum", bin.num=101)
+    }) -> tmp3
+
+plotSmoothMetaMatrix(tmp3, x = seq(-50000, 50000, by=1000), ylim=c(0, 0.03), 
+                     main = "EnhA1 density around expression SOM Classes (promDominant promoters only)")
+#tmp3 %>% map(colMeans) %>% do.call(what=cbind) %>% 
+#    matplot(type="l", x = seq(-50000, 50000, by=4000), xlab="position wrt promoter",
+#            main = "EnhA1 density around expression SOM Classes (promDominant promoters only)", ylab="", lwd=2)
+legend("topleft", legend = names(promDominantBySom), lty=1:5, col=1:6, lwd=2)
+
+```
+
+```{r fig.height=7, fig.width=12}
+consClusBySom <- tibble(som = consClusKm$som.s7) %>%
+    mutate(promI = row_number()) %>% 
+    mutate(som = as.character(som)) %>%
+    group_by(som) %>%
+    summarise(l=list(promI)) %>%
+    pull(l, name = som) %>%
+    map(~consClusKm[.])
+
+consClusBySom %>% map(function(prom)
+    {
+        ScoreMatrixBin(pdre[pdre$Prim5 %in% c("5_EnhA1")] %>% resize(width = 1, fix = "center"),
+                       prom+50250, strand.aware = T, bin.op = "sum", bin.num=26)
+    }) -> tmp4
+
+plotSmoothMetaMatrix(tmp4, x = seq(-50000, 50000, by=4000), ylim=c(0, 0.12), 
+                     main = "EnhA1 density around expression SOM Classes (promDominant promoters only)")
+
+#    map(colMeans) %>% 
+#    do.call(what=cbind) %>% 
+#    matplot(type="l", x = seq(-50000, 50000, by=4000), xlab="position wrt promoter",
+#            main = "EnhA1 density around expression SOM Classes (all consensus clusters)", ylab="", lwd=2)
+legend("topleft", legend = names(promDominantBySom), lty=1:5, col=1:6, lwd=2)
+
+```
+
+
+# add gene symbols and descritpions to the promDominant:
+```{r}
+gene <- getBM( attributes = c("ensembl_transcript_id", "external_gene_name", 
+                              "description"),
+               mart = mart)  
+# the rows are unique with respect to the first column
+
+mcols(promDominant) <-  cbind.DataFrame(mcols(promDominant), 
+                                        match(promDominant$EnsTx %>% str_split("\\.") %>% map(`[`, 1) %>% unlist(), 
+                                             gene$ensembl_transcript_id) %>%
+                                            (function(.) (gene[., c("external_gene_name", "description")]))
+)
+promDominant
+```
+
+
+Produce coloured stacked heatmaps of all proms in a group
+```{r fig.height=3, fig.width=4}
+smList2heatMeta <- function(smL, rows=NULL, trimLeft=0, trimRight=0, outF=NULL,
+                            width = 4, height = 2.5, main="")
+{
+    if(is.null(rows))
+        rows <- 1:(dim(smL[[1]])[1])  #assumption all sms have the same dimensions
+    smL %>%  
+        map(function(sm) sm[rows, (trimLeft+1):(dim(sm)[2]-trimRight)]) %>% # trimming
+        as("ScoreMatrixList") %>%
+        {
+            if(!is.null(outF))
+                pdf(outF, width = width, height = height)
+            heatMeta(., meta.rescale = T, cex.axis=0.8, xlab="", main = main,
+                 col=colorRampPalette(c("white", "darkblue"))(255))
+            if(!is.null(outF))
+                dev.off()
+        } %>% 
+        invisible()
+}
+
+smList2heatMeta(sp.damir.L[grepl("prim5", names(sp.damir.L))], outF = "test.pdf")
+smList2heatMeta(sp.damir.L[grepl("dome", names(sp.damir.L))])
+```
+
+```{r fig.height=3, fig.width=4}
+promIbyClassAndExpression %>% 
+    map(~.[["promI"]]) %>%
+    imap(~smList2heatMeta(sp.damir.L[grepl("prim5", names(sp.damir.L))][c(3,1,2)],
+                         rows = .x, outF = paste0("fig3d.", .y, ".pdf"), 
+                         trimLeft = 100, trimRight = 200, main = .y,
+                         width = 4, height = 3))
+```
+
+
+```{r}
+
+promIbyClassAndExpression %>% 
+    map(~promDominant[.$promI]) %>%
+    map(narrow, 800, 801) %>%  # because we want ucsc convention
+    map(as, "data.frame") %>%
+    map(select, -c("width", "consensus.cluster", "postMbtMaxMeanE", "EnsTxI")) %>%
+    map(rename, chromosome=seqnames,
+        TsrMeanPostMbtExpression = postMbtItsConsensusClusterMeanExpr,
+        TsrMaxPostMbtExpression = postMbtItsConsensusClusterMaxExpr,
+        EnsemblTranscript = EnsTx,
+        distanceToEnsemblTranscriptStart = EnsTxDist,
+        EnsemblGene = EnsG,
+        dominantTssStart_bed = start,
+        dominantTssEnd_bed = end) %>%
+    write.xlsx("promotersByClassAndExpression.xlsx")
+```
+
+
+
+
+Phast cons as horizontal violin plots:
+```{r fig.height=7, fig.width=5}
+vioplotFig3 <- function(dataL, main="", ...)
+{
+    par(mar=c(3.1, 10.1, 2.1, 0.1))
+     dataL %>% rev() %>% 
+        vioplot(main=main, horizontal=T, lineCol=NA, rectCol="white",
+            col=(1:8) %>% rev(), las=2, ...=...)  #[c(6, 1, 4, 8, 2, 3, 5, 7)]
+}
+
+pdf("violin.phastcons.vertebrates_4in_7in.pdf", 4, 7)
+vioplotFig3(promIbyClassAndExpression %>% map(~phastV[pull(., "promI"),1]), main="Phast Cons vertebrates")
+dev.off()
+
+pdf("violin.post-mbt-expression_4in_7in.pdf", 4, 7)
+vioplotFig3(promIbyClassAndExpression %>% 
+                map(~pull(., postMbtItsConsensusClusterMeanExpr)) %>% 
+                map(~.+1) %>% map(log2) %>% map(~.-log2(1)),
+            main="post-MBT expression")
+dev.off()
+
+```
+GRB percentage as horizontal violin plots:
+```{r fig.height=4, fig.width=4}
+countOverlaps(promDominant, grbTarget) %>%
+    {
+        map(promIbyClassAndExpression, function(k) .[pull(k, "promI")])
+    } %>%
+    map(`>`, 0) %>%
+    map(as.numeric) %>%
+    map(mean) %>%
+    # reorder
+    `[`(c("double NFR", "medium zygotic", "narrow", "wide",
+          "medium constitutive", "upstream offset", "weak open", "strong open")) %>%
+    rev() %>%    #because barplot draws bottom to top
+    do.call(what = c) %>%
+    {
+        pdf("bar.grbPercentage_4in_4in.pdf", 4, 4)
+        par(mar=c(3.1, 10.1, 2.1, 0.1))
+        barplot(. * 100, horiz=T, col=(1:8) %>% rev(), las=1, border=T, axes=F)  # old order of colours [c(6, 1, 4, 8, 2, 3, 5, 7)]
+        axis(1, at = c(0, 2, 4, 6, 8), labels = c("0", "2%", "4%", "6%", "8%"))
+        dev.off()
+    }
+
+```
+Violins showing interquantile width.
+iqw is normally calculated per sample. We need to have it per consensus cluster.
+Approach 1: pool all post-MBT cage and calculate iqw... But this is tricky.
+```{r}
+tmp <- toIqw %>% map(~iqw(.[,1], .[,2], q=0.1)) %>% unlist()
+tmp2 <- toIqw %>% map(~iqw(.[,1], .[,2], q=0.2)) %>% unlist()
+
+pdf("violin.post-mbt-promWidth_4in_4in.pdf", 4, 4)
+promIbyClassAndExpression %>%
+    # reorder
+    `[`(c("double NFR", "medium zygotic", "narrow", "wide",
+          "medium constitutive", "upstream offset", "weak open", "strong open")) %>%
+    map(pull, "promI") %>%
+    map(~tmp[.]) %>%
+    vioplotFig3(ylim=c(0,100), main="TSR width (10%-90%) [bp]", h=2)
+dev.off()
+```
+
+
+64 violin plots between flow states
+```{r fig.height=7, fig.width=12}
+consens.meanLogTPmPlus05PerStage <- read.table("../AnalysisUnmerged/consens.meanLogTpmPlus05PerStage.canonicalEntireConsCl.df") %>% makeGRangesFromDataFrame(keep.extra.columns = T)
+
+(promDominant$consensus.cluster %in% consens.meanLogTPmPlus05PerStage$consensus.cluster) %>% `!` %>% sum()
+# cool, so all we have expression or all of them (as it should be unless messed up)
+isSorted(promDominant$consensus.cluster)  # yes
+isSorted(consens.meanLogTPmPlus05PerStage$consensus.cluster)  # yes
+
+consens.meanLogTPmPlus05PerStage.AlignedPromDominant <- consens.meanLogTPmPlus05PerStage[which(consens.meanLogTPmPlus05PerStage$consensus.cluster %in% promDominant$consensus.cluster), ]
+```
+
+
+The original order in clustering
+c("double NFR", "medium zygotic", "narrow", "wide",
+                                        "medium constitutive", "upstream offset", 
+                                        "weak open", "strong open")
+```{r}
+#atacClassN <- c("double NFR", "medium zygotic", "narrow", "wide",
+#                       "medium constitutive", "upstream offset", "weak open", "strong open")
+```
+                                        
+
+
+```{r fig.height=7, fig.width=12}
+svg("flow.vioplots.svg", 6, 6)
+layout(matrix(1:64, nrow=8, byrow = T))
+#plot(0, type="n");
+#map(1:8, function(i) {plot(0, type="n"); text(i)} )
+tibble(domeC=atacClassN[krL.dome$cluster], 
+       prim5C=atacClassN[krL.prim5[["0.006"]]$cluster],
+       domeExpr=consens.meanLogTPmPlus05PerStage.AlignedPromDominant$s30pc_epi - log2(0.5),
+       prim5Expr=consens.meanLogTPmPlus05PerStage.AlignedPromDominant$prim5 - log2(0.5)) %>%
+    group_by(domeC, prim5C) %>%
+    summarise(logFC = list(prim5Expr - domeExpr)) %>%
+    mutate(flow=paste(domeC, prim5C, sep = "->")) %>%
+    pull(logFC, name = flow) %>% 
+    imap(function(d, n)
+    {
+        par(mar=c(1,1,1,1))
+        vioplot(d, box=F, ylim=c(-6,6), axes=F, xaxt='n',
+                xlim=c(0.5, 1.5), main=paste(#n,
+                                             length(d)), cex.main=0.6)
+        #grid()
+        abline(h=0, col="gray80", lty=3)
+        abline(h=-2, col="gray80", lty=3)
+        abline(h=-4, col="gray80", lty=3)
+        abline(h=2, col="gray80", lty=3)
+        abline(h=4, col="gray80", lty=3)
+    }) %>% invisible()
+dev.off()
+```
+
+-700 + 600 scales for the figure.
+```{r}
+pdf("xscale.pdf")
+plot(c(-700, 600), c(1,1), type="n", axes=F); axis(1, at = c(-700, 0, 600)) 
+#, tick = seq(-700, 600, by=100))
+minor.tick(nx = 2)
+dev.off()
+```
+
+
