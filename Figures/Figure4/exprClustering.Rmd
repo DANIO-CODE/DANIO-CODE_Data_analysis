@@ -1,0 +1,242 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(GenomicRanges)
+library(BSgenome.Drerio.UCSC.danRer10)
+library(purrr)
+library(dplyr)
+library(plyranges)
+library(heatmaps)
+
+# dependency: consensus cluster expression
+consExpr <- read.delim2("/mnt/piotrcluster/DanioCodeCage/AnalysisUnmerged/consens.meanLogTpmPlus05PerStage.canonicalEntireConsCl.df") %>% makeGRangesFromDataFrame(keep.extra.columns=T, seqinfo=seqinfo(Drerio))
+
+e <- consExpr@elementMetadata[, 2:17] %>% as.matrix() %>% `mode<-`("numeric")
+rowMeans(e) %>% hist(100, main="mean log-expression levels",
+                     xlab="log(x + 0.5 tpm) [tpm]")
+```
+
+```{r}
+e2 <- (2^e + 1.5) %>% log2
+rowMeans(e2) %>% hist(100, main="mean log-expression levels",
+                     xlab="log(x + 2.0 tpm) [tpm]")
+```
+
+```{r fig.height=12, fig.width=9}
+eRowNorm <- e %>% 
+  rowMeans() %>% 
+  {e - matrix(., nrow=length(.), ncol=ncol(e))}
+
+eColNorm <- e %>% {. - matrix(colMeans(.), nrow=dim(.)[1], ncol=dim(.)[2], byrow=T)}
+
+eRowColNorm <- eRowNorm %>% 
+    colMeans() %>% 
+    {eRowNorm - matrix(., nrow=dim(e)[1], ncol=dim(e)[2], byrow=T)}
+
+Heatmap(eRowColNorm) %>% 
+    plotHeatmap(options=heatmapOptions(label=T, legend=T ))
+
+```
+
+```{r}
+map(2:8, function(nClus)
+{
+    k <- kmeans(eRowNorm, centers=nClus, iter.max=100, nstart=10)
+    k$centers %>% t() %>% 
+        matplot(type="l", las=2, xaxt="n")
+    axis(1, at=1:16, labels=colnames(e), las=2)
+})
+
+```
+
+```{r fig.height=5, fig.width=8}
+kmL <- map(1:8, function(nClus)
+{
+    set.seed(4991)
+    par(mar=c(8, 4, 2, 0))
+    k <- kmeans(eRowColNorm, centers=nClus, iter.max=200, nstart=100)
+    k$centers %>% t() %>% 
+        matplot(type="b", lwd=2, las=2, xaxt="n", ylab="",
+                main=paste(nClus, "clusters"), pch=1)
+    axis(1, at=1:16, labels=colnames(e), las=2)
+    k
+})
+
+```
+
+```{r fig.height=5, fig.width=8}
+set.seed(4991)
+par(mar=c(8, 4, 2, 0))
+k <- kmeans(eColNorm, centers=16, iter.max=200, nstart=10)
+k$centers %>% t() %>% 
+    matplot(type="b", lwd=2, las=2, xaxt="n", ylab="",
+            main=paste(16, "clusters"), pch=1)
+axis(1, at=1:16, labels=colnames(e), las=2)
+```
+
+```{r fig.height=5, fig.width=8}
+e2RowNorm <- e2 %>% 
+  rowMeans() %>% 
+  {e2 - matrix(., nrow=length(.), ncol=ncol(e2))}
+
+e2ColNorm <- e2 %>% {. - matrix(colMeans(.), nrow=dim(.)[1], ncol=dim(.)[2], byrow=T)}
+
+e2RowColNorm <- e2RowNorm %>% 
+  colMeans() %>% 
+  {e2RowNorm - matrix(., nrow=dim(e2)[1], ncol=dim(e2)[2], byrow=T)}
+
+kmL2 <- map(1:8, function(nClus)
+{
+    set.seed(4991)
+    par(mar=c(8, 4, 2, 0))
+    k <- kmeans(e2ColNorm, centers=nClus, iter.max=200, nstart=10)
+    k$centers %>% t() %>% 
+        matplot(type="b", lwd=2, las=2, xaxt="n", ylab="",
+                main=paste(nClus, "clusters"), pch=1)
+    axis(1, at=1:16, labels=colnames(e), las=2)
+    k
+})
+```
+
+```{r fig.height=5, fig.width=8}
+set.seed(4991)
+par(mar=c(8, 4, 2, 0))
+k <- kmeans(e2ColNorm, centers=16, iter.max=200, nstart=10)
+k$centers %>% t() %>% 
+    matplot(type="b", lwd=2, las=2, xaxt="n", ylab="",
+            main=paste(16, "clusters"), pch=1)
+axis(1, at=1:16, labels=colnames(e), las=2)
+```
+
+```{r}
+consExpr  # consensus.clusters are unique
+kmL[[6]]$cluster 
+
+consClu <- consExpr
+elementMetadata(consClu) <- cbind.data.frame(
+    elementMetadata(consExpr)[, "consensus.cluster", drop=F],
+    map(kmL, `$`, "cluster") %>% `names<-`(paste0("km.", 1:8)) %>% as.data.frame()
+)
+
+saveRDS(kmL, "kmL.RDS")
+saveRDS(consClu, "concCluKm.RDS")
+
+```
+
+Violin plots:
+
+```{r fig.height=6, fig.width=14}
+library(ggplot2)
+theme_set( theme_classic( base_size = 18) + theme(axis.text.x=element_text(angle = 90, hjust = 0)))  #+ theme(legend.position = "top")
+library(tidyr)
+
+# e %>% as_tibble() %>%
+#     mutate(clu=kmL[[2]]$cluster) %>%
+#     group_by(clu) %>%
+#     summarise_each(list) #%>%
+# 
+# 
+# e %>% as_tibble() %>%
+#     mutate(clu=kmL[[2]]$cluster %>% as.factor()) %>%
+#     as.data.frame() %>%
+#     ggplot( aes(x=clu, y=fert_egg)) + 
+#     geom_violin() +
+#     xlab("class") +
+#     theme(legend.position="none") +
+#     xlab("")
+
+map(6:8, function(nClus)
+{
+  as.data.frame(e) %>%
+    split.data.frame(kmL[[nClus]]$cluster) %>%
+    imap(function(cluDf, clusNo)
+    {
+        pivot_longer(cluDf, everything(), names_to="stage", values_to="expr") %>%
+        ggplot(aes(x=stage, y=expr)) +
+        geom_violin(fill="lightblue", trim=F) +
+        scale_x_discrete(limits=colnames(e)) +
+        stat_summary(fun=mean, geom="point", size=2, color="red") +
+        #geom_boxplot(width=0.1)
+        stat_summary(fun.data=function(x) mean_sdl(x , mult=1),
+                 geom="pointrange", color="red") +
+        labs(title=paste0("nClusters = ", nClus, ", clusNo = ", clusNo, ", nPromoters = ", dim(cluDf)[1]),
+             x="", y = "log2(expression + 0.5 tpm)")
+    }) %>% invisible()
+}) #%>% invisible()
+
+
+
+```
+
+```{r fig.height=6, fig.width=14}
+map(1:8, function(nClus)
+{
+  as.data.frame(e2) %>%
+    split.data.frame(kmL2[[nClus]]$cluster) %>%
+    imap(function(cluDf, clusNo)
+    {
+        pivot_longer(cluDf, everything(), names_to="stage", values_to="expr") %>%
+        ggplot(aes(x=stage, y=expr)) +
+        geom_violin(fill="lightblue", trim=F) +
+        scale_x_discrete(limits=colnames(e2)) +
+        stat_summary(fun=mean, geom="point", size=2, color="red") +
+        #geom_boxplot(width=0.1)
+        stat_summary(fun.data=function(x) mean_sdl(x , mult=1),
+                 geom="pointrange", color="red") +
+        labs(title=paste0("nClusters = ", nClus, ", clusNo = ", clusNo, ", nPromoters = ", dim(cluDf)[1]),
+             x="", y = "log2(expression + 2.0 tpm)")
+    }) %>% invisible()
+}) #%>% invisible()
+```
+
+```{r}
+library(cluster)
+gap_stat <- clusGap(eRowColNorm, FUN = kmeans, nstart = 25,
+                    K.max = 10, B = 50)
+```
+
+SOM
+
+```{r}
+library(som)
+s <- som(eRowColNorm, 5, 5)
+s2 <- som(e2RowColNorm, 5, 5)
+plot(s2)
+s6 <- som(eRowColNorm, 6, 6)
+plot(s6)
+saveRDS(s, "som.5.5.pc05.fullNorm.RDS")
+saveRDS(s2, "som.5.5.pc20.fullNorm.RDS")
+saveRDS(s6, "som.6.6.pc05.fullNorm.RDS")
+```
+
+```{r fig.height=6, fig.width=6}
+plot(s)
+
+```
+
+```{r fig.height=12, fig.width=16}
+set.seed(4991)
+s7 <- som(eColNorm, 5, 5)
+plot(s7, ylim=c(-6, 3))
+```
+
+```{r fig.height=12, fig.width=16}
+set.seed(4991)
+s8 <- som(eColNorm, 9, 9)
+plot(s8, ylim=c(-6, 3))
+```
+
+```{r fig.height=12, fig.width=16}
+set.seed(4991)
+s9 <- som(eColNorm, 7, 7)
+plot(s9, ylim=c(-6, 3))
+```
+
+```{r}
+saveRDS(s7, "s7.RDS")
+saveRDS(s8, "s8.RDS")
+saveRDS(s9, "s9.RDS")
+```
