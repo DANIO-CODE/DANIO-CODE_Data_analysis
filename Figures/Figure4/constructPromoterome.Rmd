@@ -1,0 +1,1137 @@
+---
+title: "Zebrafish Promoterome"
+output: html_notebook
+---
+
+<H4>
+To download the results scroll to the bottom of the page.
+
+<br><br>
+Steps:
+<ul>
+<li>Input: <u>myCAGEset_bt1_G_removed_1tpm_quantile.RDS</u> ("G" removed from every 5' end regardless if it matches the genome or not) from Kadir.
+<li>Filter out badly assembled or otherwise problematic genomic regions. Input: <u>danRer10_blacklist.srt.bed</u> from Damir.
+<li>Compare nanti vs tagging samples
+<li>Remove all TSSs which are not YC or YR - initiated
+<li>Power-law-normalise with params: fitInRange = c(5, 1000), alpha = 1.1
+<li>Cluster TSSs into TCs using the following params: threshold = 0.7, thresholdIsTpm = TRUE, nrPassThreshold = 1,
+            method = "distclu", maxDist = 20, removeSingletons = TRUE, 
+            keepSingletonsAbove = 5
+<li>Produce consensus clusters with tpmThreshold = 1.0, qLow = NULL, qUp = NULL, maxDist = 20
+<li>Keep consensus clusters which are expressed in at least 2 consecutive stages (i.e. there exist a such TCs within consensus cluster. So at least 1 tpm. NOT the summed up expression, which can be higher)
+<li>Produce an expression matrix the CAGEr way (including signal only the TCs above 1 tpm within consensus clusters.)
+<li>Run PCA: looks good, samples follow developmental time, and nanti vs tagging CAGE fall nearby.
+<li>Average expression across samples originating from the same developmental stage (normalised expression mean)
+<li>Compute dominant TSS per consensus cluster across all stages. Probably not relevant, because it merges maternal RNAs with zygotic newly transcribed RNAs.
+<li>(Relise that CAGEr does not include all signal in consensus cluster.) Produce normalised expression matrix per stage which includes all TSSs within consensus clusters.
+</ul>
+
+<br>Below is the entire code which was run to create <b>CAGE TCs</b>, <b>consensus clusters (TSRs)</b> and <b>normalised expression of consensus clusters</b>.<br>
+</H4>
+
+
+```{r message=FALSE, warning=FALSE}
+#Initialise packages; database connections, and load CAGEr 1.20
+# CAGEr  1.20
+if("genomation" %in% .packages())
+    detach("package:genomation", unload=TRUE)
+if("data.table" %in% .packages())
+    detach("package:data.table", unload=TRUE)
+if("CAGEr" %in% .packages())
+    detach("package:CAGEr", unload=TRUE) 
+library(data.table, lib.loc="/usr/local/lib/R/backports")  # version 1.12.8   (1.13 breaks CAGEr 1.20)
+library(CAGEr, lib.loc="/usr/local/lib/R/backports")   # version 1.20
+
+library(dplyr); 
+library(purrr); library(furrr)
+source("MyLibs/safeEcdf.R")
+library(openxlsx)
+library(GenomicFeatures)
+library(BSgenome.Drerio.UCSC.danRer10)
+library(AnnotationDbi)
+library(data.table)
+source("MyLibs/fancyCorrMat.R")
+library(factoextra)
+library(ggrepel)
+library(Hmisc);
+library(factoextra)
+ 
+#### check overlap with Ens Tx
+ens10Tss <- txDb.ucsc.danRer10 = makeTxDbFromUCSC(genome="danRer10", tablename="ensGene") %>%
+    promoters(upstream = 0, downstream = 1)
+```
+
+
+Function to filter out bad regions:
+```{r}
+#chr1    0       107400  Low Mappability
+#chr1    175400  220100  High Signal Region
+badR <- fread("Annotations/danRer10_blacklist.srt.bed") %>%
+    with(GRanges(V1, IRanges(V2+1, V3), reason=V4, seqinfo=seqinfo(Drerio)))
+head(badR, 3)
+```
+
+Load object, which contains manually G-removed CAGE tags;
+Object name is <b>myCAGEset_bt1_G_removed</b> and it is a CAGEr 1.20 obj.
+```{r}
+# dependency
+load("../FromKadir/myCAGEset_bt1_G_removed_1tpm_quantile.RDS")  # this is NOT an RDS
+cs.Grm <- myCAGEset_bt1_G_removed
+rm("myCAGEset_bt1_G_removed")
+
+```
+
+Read 5' enriched RNA seq. It is like CTSS
+```{r}
+rnaTssR = list()
+import.CTSS <- function(f)
+{
+    fread(f) %>% mutate(start=start+1) %>%  # correction for GRanges refusing to use UCSC coordinates
+    makeGRangesFromDataFrame(keep.extra.columns=T, seqinfo=seqinfo(Drerio)) %>%
+    { badI = overlapsAny(., badR); .[!badI] }
+}
+# dependency
+rnaTssR$c14 <- import.CTSS("5primEnrRnaSeqFromYavor/TeloPPrim5_CON14.CTSS.txt")
+rnaTssR$c16 <- import.CTSS("5primEnrRnaSeqFromYavor/TeloPPrim5_CON16.CTSS.txt")
+head(rnaTssR$c14, 3)
+```
+
+
+
+
+
+Remove blacklisted regions:
+```{r}
+badCtssI <- cs.Grm@CTSScoordinates %>% 
+    with(GRanges(chr, IRanges(pos, width=1), strand=strand)) %>% 
+    overlapsAny(badR)
+cs.noBad <- cs.Grm
+cs.noBad@CTSScoordinates <- cs.Grm@CTSScoordinates[!badCtssI, ]
+cs.noBad@tagCountMatrix  <- cs.Grm@tagCountMatrix[!badCtssI, ]
+cs.noBad@librarySizes    <- cs.noBad@tagCountMatrix %>% colSums() %>% as("integer")
+par(mar=c(9, 4, 2, 2))
+barplot(t(matrix(c(cs.Grm@librarySizes, cs.noBad@librarySizes), ncol = 2) %>%
+              `rownames<-`(cs.Grm@sampleLabels)
+         ),
+        beside=T, col=c("red", "blue"), cex.names=0.8, las=2,space = c(0, 2),
+        #legend=c("full", "no bad regions"),
+        main="library sizes before and after bad region removal")
+
+```
+How what are the percentage of reads removed in nanti and in tagging?
+```{r}
+isLibNanti <- cs.Grm@sampleLabels %>% strsplit("_") %>% map(`[[`, 1) %>% `==`("nanti")
+isLibNantiJoe <- 
+  cs.Grm@sampleLabels %>% strsplit("_") %>%
+  map(~.[[1]] == "nanti" && ((. == "Joe") %>% sum())) %>% unlist() %>% unname()
+isLibNantiYavor <-
+  cs.Grm@sampleLabels %>% strsplit("_") %>%
+  map(~.[[1]] == "nanti" && ((. == "Yavor") %>% sum())) %>% unlist() %>% unname()
+tibble(isLibNanti, 
+           isLibNantiJoe, 
+           isLibNantiYavor, 
+           before=cs.Grm@librarySizes, 
+           after=cs.noBad@librarySizes) %>%
+    group_by(isLibNanti, isLibNantiJoe, isLibNantiYavor) %>% 
+    summarise(pcBad = list(a=1-after/before)) %>% 
+    {
+      ret=.$pcBad; 
+      `names<-`(ret, ifelse(.$isLibNantiJoe, yes = "nanti Joe",
+                            no = ifelse(.$isLibNantiYavor, "nanti Yavor", "tagging")))
+      } %>%
+    #map(sort) %>% map(~cat(paste(.))) %>%
+    {
+      vioplot::vioplot(., main="percentage of reads from bad regions",
+                      col=c("darkgreen", "darkorange", "purple"))
+    }
+```
+
+
+
+
+Function to get TSS dinucleotides from a cageset.
+Bad stands for "N" and off-chromosome "bases".
+```{r}
+# argument is a CAGEset object or GRanges with tagCount mcol. It takes into account the number of init events:
+getDinuc2 <- function(cs, filterBad=TRUE, sampleName=NULL)
+{
+    if(class(cs) == "CAGEset")
+    {
+      dinucR <- cs@CTSScoordinates %>% 
+        with(GRanges(chr, IRanges(pos, width=1), strand, seqinfo=seqinfo(Drerio)))
+      tagCountMatrix <- cs@tagCountMatrix
+    }
+    else  # GRanges with a single tagCount mcol.
+    {
+      dinucR <- cs 
+      tagCountMatrix <- cs$tagCount %>% as.matrix()
+      if(is.null(sampleName))
+         colnames(tagCountMatrix) <- "tagCount"
+      else
+         colnames(tagCountMatrix) <- sampleName
+    }
+    dinucR <- dinucR %>% promoters(upstream = 1, downstream = 1)
+          # can generate Ns and off-chromosome results
+    goodI <- dinucR %>% {. == trim(.)}
+    tmp1  <- getSeq(Drerio, dinucR[goodI]) %>% as.character()
+    #return(tagCountMatrix)
+    if(filterBad)
+    {
+        goodI2 <- tmp1 %>% {!grepl("N", .)}
+        tt <- tibble(dinuc=tmp1[goodI2])
+        
+        map(as.data.frame(tagCountMatrix), function(s)
+        {
+            cbind(tt, s=s[goodI][goodI2]) %>% group_by(dinuc) %>%
+                summarise(s=sum(s)) %>% 
+                {
+                    ret <- .[["s"]]
+                    names(ret) <- .[["dinuc"]]
+                    ret
+                }
+        }) %>% do.call(what=cbind)
+    }
+    else
+    {
+        ret <- rep("NN", length(dinucR))
+        ret[goodI] <- tmp1
+        tt <- tibble(dinuc=ret)
+        map(as.data.frame(tagCountMatrix), function(s)
+        {
+            cbind(tt, s=s) %>% group_by(dinuc) %>%
+                summarise(s=sum(s)) %>% 
+                {
+                    ret <- .[["s"]]
+                    names(ret) <- .[["dinuc"]]
+                    ret
+                }
+        }) %>% do.call(what=cbind)
+    }
+}
+```
+
+
+Get dinucleotide matrix and normalise to percentage per sample:
+```{r get dinucleotides}
+dinuc.mat.noBad <- getDinuc2(cs.noBad, filterBad = T) %>% apply(2, function(r)
+{
+  r / sum(r)  
+}) %>% t()
+
+dinuc.mat.5rna <- rbind(
+getDinuc2(rnaTssR$c14, filterBad = T, sampleName = "5' RNA-seq rep1") %>% apply(2, function(r)
+  {
+     r / sum(r)  
+  }) %>% t()
+,
+getDinuc2(rnaTssR$c16, filterBad = T, sampleName = "5' RNA-seq rep2") %>% apply(2, function(r)
+  {
+     r / sum(r)  
+  }) %>% t()
+)
+
+#dinuc.mat.5rna <- cbind(getDinuc2(rnaTssR$c14, filterBad = F), 
+#                        getDinuc2(rnaTssR$c16, filterBad = F)) %>%
+#  apply(2, function(r)
+#  {
+#     r / sum(r)  
+#  }) %>% t()
+#rownames(dinuc.mat.5rna) <- c("5' RNAseq prim5, 14 PCR cycles", "5' RNAseq prim5, 16 PCR cycles")
+```
+
+
+
+Per dinucleotide sample frequency in G-removed, bad region-filtered CAGE. <br>
+Yavor -- orange
+Joe -- purple
+tagging -- dark green
+5' RNA-seq -- light green
+```{r}
+rbind(dinuc.mat.noBad, dinuc.mat.5rna) %>% as.data.frame() %>% imap(function(x, dinuc) 
+        barplot(x, beside=T, cex.names = 0.6, las=2,
+                col = ifelse(c(isLibNantiYavor, F, F), "darkorange",
+                             ifelse(c(isLibNantiJoe, F, F), "purple", 
+                                    ifelse(c(rep(F, length(isLibNanti)), c(T, T)),
+                                    "lightgreen", "darkgreen"))),
+                main = dinuc )
+         ) %>% invisible()
+```
+
+Per sample dinucleotide frequency in G-removed, bad region-filtered CAGE:
+```{r}
+iupac.y = c('C', 'T')
+iupac.r = c('A', 'G')
+iupac.yc <- outer(iupac.y, "C", paste0) %>% as.vector()
+iupac.yr <- outer(iupac.y, iupac.r, paste0) %>% as.vector()
+canonDinuc <- c(iupac.yc, iupac.yr)
+#canonDinuc <- c("CC", "TC", "CA", "CG", "TA", "TG")
+rbind(dinuc.mat.noBad, dinuc.mat.5rna) %>% t() %>% as.data.frame() %>% imap(function(x, samp)
+{
+    names(x) <- outer(c("A", "C", "G", "T"), c("A", "C", "G", "T"), FUN = paste0) %>%
+        as.vector() %>% sort()
+    barplot(x, beside=T, cex.names = 1, las=2, main = samp,
+            col = ifelse(names(x) %in% iupac.yc, yes = "darkgreen",
+                         no = ifelse(names(x) %in% iupac.yr, "plum", "black")),
+            ylim = c(0, 0.45)
+           )
+}) %>% invisible()
+
+```
+
+Create a CAGE set with removed non-canonical
+```{r}
+canonI <- (cs.noBad@CTSScoordinates %>% 
+  with(GRanges(chr, IRanges(pos, width=1), strand, seqinfo=seqinfo(Drerio))) %>%
+  promoters(upstream = 1, downstream = 1)%>% getSeq(Drerio, names=.) %>%
+  as.character()) %in% canonDinuc
+
+cs.canon <- cs.noBad
+cs.canon@CTSScoordinates <- cs.noBad@CTSScoordinates[canonI, ]
+cs.canon@tagCountMatrix  <- cs.noBad@tagCountMatrix[canonI, ]
+cs.canon@librarySizes    <- cs.canon@tagCountMatrix %>% colSums() %>% as("integer")
+
+```
+
+
+
+
+```{r}
+barplot(t(matrix(c(cs.Grm@librarySizes, 
+                   cs.noBad@librarySizes,
+                   cs.canon@librarySizes), ncol = 3) %>%
+              `rownames<-`(cs.Grm@sampleLabels)
+         ),
+        beside=T, col=c("red", "blue", "green"), cex.names=0.8, las=2, space = c(0, 3),
+        #legend=c("full", "no bad regions"),
+        main="library sizes: with bad regions, without bad regions, canonical only")
+```
+
+
+```{r}
+isLib5Rnaseq <- c(rep(F, length(isLibNanti)), T, T)
+isLibNantiExt <- c(isLibNanti, F, F)
+isLibNantiJoeExt = c(isLibNantiJoe, F, F)
+isLibNantiYavorExt = c(isLibNantiYavor, F, F)
+
+tibble(isLibNantiJoeExt, 
+           isLibNantiYavorExt,
+           isLib5Rnaseq,
+           before=c(cs.noBad@librarySizes, 1.0 ,1.0), 
+           after=c(cs.canon@librarySizes, 
+                   dinuc.mat.5rna[, colnames(dinuc.mat.5rna) %in% canonDinuc] %>% rowSums()
+                   )
+           ) %>%
+    {
+      (1-(.$after/.$before)) %>% 
+        barplot(col = ifelse(isLibNantiYavorExt, "darkorange",
+                        ifelse(isLibNantiJoeExt, "purple", 
+                            ifelse(isLib5Rnaseq, "lightgreen", "darkgreen"))) ,
+                main = "percentage of expression of non-canonical cTSSs
+                in G-removed dataset")
+      .
+    } %>%
+    
+    group_by(isLibNantiJoeExt, isLibNantiYavorExt, isLib5Rnaseq)  %>% 
+    summarise(pcBad = list(a=1-after/before)) %>% 
+    {
+      .
+      ret=.$pcBad; 
+      # warning: group names assigned by hand if grouping changes, you need to correct here
+      names(ret) <- c("Tagging", "5' RNA-seq", "Nanti Yavor", "Nanti Joe")
+      ret
+    } %>%
+    vioplot::vioplot(., main="percentage of non-canonical dinuc tags", 
+                      col=c("darkgreen", "lightgreen", "darkorange", "purple"),
+                      ylim=c(0,0.45))
+```
+
+Export pooled tracks for 全部 browser:
+```{r}
+exportPooledTracks <- function(cs, csName)
+{
+  cs@CTSScoordinates %>% 
+    with(GRanges(chr, IRanges(pos, width=1), strand=strand, 
+                 score = cs@tagCountMatrix %>% rowSums(),
+                 seqinfo=seqinfo(Drerio)
+                )
+        ) %>%
+    {
+        .[strand(.) == "+"] %>% 
+            export.bw(paste0(csName, ".pooled.+.bw"))
+        .[strand(.) == "-"] %>% {.$score = - .$score; .} %>%
+            export.bw(paste0(csName, ".pooled.-.bw"))
+    }
+}
+```
+
+```{r}
+exportPooledTracks(cs.noBad, "cs.noBad")
+exportPooledTracks(cs.canon, "cs.canon")
+```
+
+
+```{r include=F}
+saveRDS(cs.canon, "cs.canon.RDS")
+saveRDS(cs.noBad, "cs.noBad.RDS")
+```
+
+# export TSS bigwigs:
+```{r}
+exportTssTracks <- function(cs, csName, dirOut)
+{
+    cs@tagCountMatrix %>% imap(function(sample, sampleName)
+    {
+        this <- cbind.data.frame(cs@CTSScoordinates, cnt=sample) %>% 
+            `[`(sample != 0, ) %>% 
+            with(GRanges(chr, IRanges(pos, width=1), strand=strand, score=cnt, seqinfo=seqinfo(Drerio)))
+        this[strand(this) == "+"] %>% export.bw(paste0(dirOut, "/tss.", sampleName, ".", csName, ".+.bw"))
+        this[strand(this) == "-"]$score <- -this[strand(this) == "-"]$score
+        this[strand(this) == "-"] %>% export.bw(paste0(dirOut, "/tss.", sampleName, ".", csName, ".-.bw"))
+    })
+    NULL
+} %>% invisible()
+exportTssTracks(cs.canon, "canon", "BigWigs/Canon")
+exportTssTracks(cs.Grm, "Grm", "BigWigs/Grm")
+```
+
+Export  bigWigs for post-MBT pooled samples. For promoter architecture;
+```{r}
+# gets a list of samples (e.g. post MBT)
+postMbtSamples <- c("nanti_4_somites_REP1_Yavor",
+                    "tagging_14_19_somites_REP1",
+                    "tagging_14_19_somites_REP2",
+                    "nanti_Prim5_REP1_Yavor",
+                    "nanti_Prim5_REP2_Yavor",
+                    "nanti_Prim5_REP3_Yavor",
+                    "tagging_24hpf",
+                    "tagging_Prim5",
+                    "tagging_Prim25_REP1",
+                    "tagging_Prim25_REP2",
+                    "nanti_LongPec_REP1_Yavor",
+                    "nanti_LongPec_REP2_Yavor")
+preMbtSamples <- c("tagging_fertilized_egg", "tagging_fertilized_egg_90_Days_2_Years", "nanti_fertilized_egg_REP1_Yavor",
+                   "tagging_1_cell",
+                   "nanti_16_cell_REP1_Joe", "nanti_16_cell_REP2_Joe",
+                   "tagging_64_cell",
+                   "nanti_128_cell_REP1_Joe", "nanti_128_cell_REP2_Joe",
+                   "nanti_512_cell_REP1_Joe", "nanti_512_cell_REP2_Joe",
+                   "tagging_High"
+                   #"tagging_Oblong"
+                   )
+
+exportTssTracksPooled <- function(cs, csName, samples)
+{
+    this <- cbind.data.frame(cs@CTSScoordinates, cnt=(cs@tagCountMatrix[, samples] %>% rowSums())) %>%
+        `[`(.$cnt != 0, ) %>%
+        with(GRanges(chr, IRanges(pos, width=1), strand=strand, score=cnt, seqinfo=seqinfo(Drerio)))
+    this[strand(this) == "+"] %>% export.bw(paste0("tss.", csName, ".+.bw"))
+    this[strand(this) == "-"]$score <- - this[strand(this) == "-"]$score
+    this[strand(this) == "-"] %>% export.bw(paste0("tss.", csName, ".-.bw"))
+} %>% invisible()
+
+exportTssTracksPooled(cs.canon, "postMbt.canon", postMbtSamples)
+exportTssTracksPooled(cs.canon, "preMbt.canon",  preMbtSamples)
+```
+
+
+A general function to remove blacklisted, get dinucleotides, plot them and export tracks (a result of no-g removal (but cager correction of mismatches):
+```{r}
+# globals: isLibNantiYavor, isLibNantiJoe, canonDinuc, badR, Drerio
+processCageObj <- function(cs, name="cs.foo")
+{
+  badCtssI <- cs@CTSScoordinates %>% 
+    with(GRanges(chr, IRanges(pos, width=1), strand=strand)) %>% 
+    overlapsAny(badR)
+  cs.noBad <- cs
+  cs.noBad@CTSScoordinates <- cs@CTSScoordinates[!badCtssI, ]
+  cs.noBad@tagCountMatrix  <- cs@tagCountMatrix[!badCtssI, ]
+  cs.noBad@librarySizes    <- cs.noBad@tagCountMatrix %>% colSums() %>% as("integer")
+  
+  dinuc.mat.noBad <- getDinuc2(cs.noBad, filterBad = T) %>% apply(2, function(r)
+  {
+    r / sum(r)  
+  }) %>% t()
+  
+  # plot:
+  dinuc.mat.noBad %>% as.data.frame() %>% imap(function(x, dinuc) 
+        barplot(x, beside=T, cex.names = 0.6, las=2,
+                col = ifelse(c(isLibNantiYavor, F, F), "darkorange",
+                             ifelse(c(isLibNantiJoe, F, F), "purple", 
+                                    ifelse(c(rep(F, length(isLibNanti)), c(T, T)),
+                                    "lightgreen", "darkgreen"))),
+                main = dinuc )
+         ) %>% invisible()
+  
+  canonI <- (cs.noBad@CTSScoordinates %>% 
+    with(GRanges(chr, IRanges(pos, width=1), strand, seqinfo=seqinfo(Drerio))) %>%
+    promoters(upstream = 1, downstream = 1)%>% getSeq(Drerio, names=.) %>%
+    as.character()) %in% canonDinuc
+
+  cs.canon <- cs.noBad
+  cs.canon@CTSScoordinates <- cs.noBad@CTSScoordinates[canonI, ]
+  cs.canon@tagCountMatrix  <- cs.noBad@tagCountMatrix[canonI, ]
+  cs.canon@librarySizes    <- cs.canon@tagCountMatrix %>% colSums() %>% as("integer")
+
+  
+  exportPulledTracks(cs.canon, name)
+  
+  return(cs.canon)
+}
+```
+
+```{r}
+cs.canon.Gcor <- processCageObj(cs.Gcor, "cs.Gcor")
+```
+
+A function which returns statistics of a particular CAGEr object:
+```{r}
+stats.cs <- function(cs, tpmThr = c(0.1, 0.3, 0.5, 0.7, 1))
+{
+    cl.ret <- tpmThr %>% `names<-`(.,.) %>% map(function(thr)
+    {
+      cat(paste("thr", thr)); cat("\n")
+      clusterCTSS(cs, threshold = thr, thresholdIsTpm = TRUE, nrPassThreshold = 1,
+            method = "distclu", maxDist = 20, removeSingletons = TRUE, 
+            keepSingletonsAbove = 5, useMulticore = T, nrCores = 16)
+    
+    tcs <- cs@sampleLabels %>% `names<-`(.,.) %>% future_map(function(s) tagClusters(cs, s))
+    
+    numTC <- tcs %>% map(dim) %>% map(`[`, 1) %>% do.call(what = rbind)
+    
+    fracEns200 <- tcs %>% map(~as(., "GRanges")) %>%
+        map(~countOverlaps(., ens10Tss + 200)) %>% map(`>=`, 1) %>% 
+        map(~sum(.)/length(.)) %>% do.call(what=rbind)
+    
+    numEnsInTc <- tcs %>% map(~as(., "GRanges")) %>%
+        map(~countOverlaps(ens10Tss + 200, .)) %>% map(`>=`, 1) %>% 
+        map(sum) %>% do.call(what=rbind)
+
+    list(numTC=numTC, fracEns200=fracEns200, tcs=tcs, numEnsInTc=numEnsInTc)
+    })
+    cl.ret
+}
+```
+
+
+Normalise samples andplot revcums:
+
+```{r}
+plotReverseCumulatives(cs.canon, fitInRange = c(5, 1000), onePlot = TRUE)
+normalizeTagCount(cs.canon, method = "powerLaw", fitInRange = c(5, 1000), alpha = 1.1)
+plotReverseCumulatives(cs.canon, fitInRange = c(5, 1000), onePlot = TRUE, values = "normalized")
+```
+
+
+Run stats on cs.canon and cluster canonical CTSSs (clusetring parameters here):
+```{r}
+plan(multiprocess)
+# just one test:
+options(future.globals.maxSize= 9 * 1024^3)  # 9 GB of globals to the function
+u <- stats.cs(cs.canon, tpmThr = 0.7)
+
+
+clusterCTSS(cs.canon, threshold = 0.7, thresholdIsTpm = TRUE, nrPassThreshold = 1,
+            method = "distclu", maxDist = 20, removeSingletons = TRUE, 
+            keepSingletonsAbove = 5, useMulticore = T, nrCores = 16)
+```
+
+Quantiles and plotting. Not sure if any of these is needed. Not sure if rerun after crash.
+```{r}
+cumulativeCTSSdistribution(cs.canon, clusters = "tagClusters")  ## very long
+quantilePositions(cs.canon, clusters = "tagClusters", qLow = 0.1, qUp = 0.9)  # very long
+plotInterquantileWidth(cs.canon, clusters = "tagClusters", tpmThreshold = 5, qLow = 0.1, qUp = 0.9)
+```
+
+
+Export canonical tag clusters as BEDs bigBeds for the track hub.
+```{r, include=F}
+list(u$`0.7`$tcs, seq_along(u$`0.7`$tcs), names(u$`0.7`$tcs)) %>% pmap(function(r, i, n)
+{
+  r <- GRanges(r , seqinfo=seqinfo(Drerio)) %>% sort.gr()
+  name <- paste0("TCs/TC_canon_07.", sprintf("%02d", i), ".", n)
+  export.bed(r, paste0(name, ".tmp.bed"))
+  system2("sort", c('-k1,1', '-k2,2n', paste0(name, ".tmp.bed")), stdout=paste0(name, ".bed"))
+  # dependency: bedToBigBed, chromInfo.txt
+  system2("bedToBigBed", c(paste0(name, ".bed"), 
+                           "/mnt/biggles/data/UCSC/goldenpath/danRer10/chromInfo.txt",
+                           paste0(name, ".bb")))
+})
+
+```
+
+Consensus clusters. Not sure if quantiles are computed here (too quick?)
+Or if they are taken from these cumulative calls above.
+```{r}
+aggregateTagClusters(cs.canon, tpmThreshold = 1.0, qLow = NULL, qUp = NULL, maxDist = 20)
+consens.canon.07 <- consensusClusters(cs.canon)
+
+getExpressionProfiles(cs.canon, what = "consensusClusters", tpmThreshold = 1,
+                      nrPassThreshold = 1, method = "som", xDim = 4, yDim = 4)
+
+plotExpressionProfiles(cs.canon, what = "consensusClusters")
+```
+
+Export the object
+```{r}
+saveRDS(cs.canon, "cs.canon.RDS")
+```
+
+Decided not to use:
+```{r}
+cs.canon.05 <- cs.canon
+library(profvis)
+profvis(
+{
+    clusterCTSS(cs.canon.05, threshold = 0.5, thresholdIsTpm = TRUE, nrPassThreshold = 1,
+            method = "distclu", maxDist = 20, removeSingletons = FALSE, 
+            useMulticore = T, nrCores = 16)
+})
+
+profvis(
+{
+    aggregateTagClusters(cs.canon.05, tpmThreshold = 3.0, qLow = 0.1, qUp = 0.9, maxDist = 20)
+    consens.canon.05 <- consensusClusters(cs.canon.05)
+})
+
+profvis(
+{
+    cumulativeCTSSdistribution(cs.canon.05, clusters = "tagClusters")  ## very long
+    quantilePositions(cs.canon.05, clusters = "tagClusters", qLow = 0.1, qUp = 0.9)  # very long
+})
+```
+
+Export correlation matrices as png images:
+```{r}
+fancyCorrMat(as.data.frame(cs.canon.05@consensusClustersTpmMatrix+1),
+             outF = "a2.png", width=2500, height=2500, bandwidth = 0.01,
+             xlim=c(1, 10000), ylim=c(1,10000), cex=2)
+
+fancyCorrMat(as.data.frame(cs.canon@consensusClustersTpmMatrix+1),
+             outF = "a3.png", width=2500, height=2500, bandwidth = 0.01,
+             xlim=c(1, 10000), ylim=c(1,10000), cex=2)
+
+### better a4 than a5:
+fancyCorrMat(as.data.frame(consens.canon.07.tagCountMatrix+1), 
+             outF = "a4.png", width=2500, height=2500, bandwidth = 0.01, 
+             xlim=c(1, 10000), ylim=c(1,10000), cex=2)
+
+fancyCorrMat(as.data.frame(consens.canon.07.canonicalTagCountMatrix+1),
+             outF = "a5.png", width=2500, height=2500, bandwidth = 0.01,
+             xlim=c(1, 10000), ylim=c(1,10000), cex=2)
+
+
+```
+
+
+2020-07-02 Extract consensus clusters and filter them in such a way that two consecutive stages expressed
+```{r}
+cs.canon@sampleLabels %>% unname()
+```
+
+```{r}
+stage2samples <- list(
+     "fert_egg"    = c("tagging_fertilized_egg", "tagging_fertilized_egg_90_Days_2_Years", 
+                       "nanti_fertilized_egg_REP1_Yavor"),
+     "s1_cell"     = c("tagging_1_cell"),
+     "s16_cell"    = c("nanti_16_cell_REP1_Joe", "nanti_16_cell_REP2_Joe"),
+     "s64_cell"    = c("tagging_64_cell"),
+     "s128_cell"   = c("nanti_128_cell_REP1_Joe", "nanti_128_cell_REP2_Joe"),
+     "s512_cell"   = c("nanti_512_cell_REP1_Joe", "nanti_512_cell_REP2_Joe", "tagging_512_cell"),
+     "high"        = c("tagging_High"),
+     "oblong"      = c("tagging_Oblong"),
+     "sphere"      = c("tagging_Sphere_REP1", "tagging_Sphere_REP2"),
+     "s30pc_epi"   = c("nanti_30pc_epi_REP1_Joe", "nanti_30pc_epi_REP2_Joe", "tagging_30pc_epi",
+                       "tagging_dome_30pc_epi"),
+     #"dome"        = c("tagging_dome_30pc_epi"),
+     "shield"      = c("tagging_Shield_REP1", "tagging_Shield_REP2"),
+     "s4_somites"  = c("nanti_4_somites_REP1_Yavor"),
+     "s14_19_somites" = c("tagging_14_19_somites_REP1", "tagging_14_19_somites_REP2"),
+     "prim5"      = c("nanti_Prim5_REP1_Yavor", "nanti_Prim5_REP2_Yavor", "nanti_Prim5_REP3_Yavor",
+                      "tagging_24hpf", "tagging_Prim5"),
+     "prim25"     = c("tagging_Prim25_REP1", "tagging_Prim25_REP2"),
+     "longPec"    = c("nanti_LongPec_REP1_Yavor", "nanti_LongPec_REP2_Yavor")
+)
+
+# invert the assignment
+sample2stage <-
+imap(stage2samples, function(samples, stage)
+{
+    map(samples %>% unname(), function(sample)
+    {
+        list(stage) %>% `names<-`(sample)
+    }) %>% unlist(recursive = F)
+}) %>% unname() %>% unlist()
+
+cutoff.consens.expressed <- 0   # cutoff for stating a consensus cluster is expressed in a sample:
+
+is.stage.expressed <- 
+    map(names(stage2samples), function(stage)
+    {
+        (consensusClustersTpm(cs.canon) > cutoff.consens.expressed) %>%
+            `[`(, stage2samples[[stage]], drop=F) %>%  # select all the samples from this stage
+            rowSums() %>% `>`(0)                       # logical OR (expressed in any of these samples)
+    }) %>% 
+    cbind.data.frame() %>% 
+    `colnames<-`(names(stage2samples))
+
+is.stage.expressed
+```
+```{r}
+stopifnot(is.stage.expressed %>% rowSums() %>% min() == 1)
+```
+OK
+
+```{r}
+# need to be expressed in two neighbouring stages:
+filter.2consecutiveStages <- 
+    (cbind(BAR=FALSE, is.stage.expressed) & cbind(is.stage.expressed, FOO=FALSE)) %>%  # names are taken from the first df
+    rowSums() %>% `>`(0)
+summary(filter.2consecutiveStages)
+```
+quite a lot!!!
+
+```{r}
+# grange of consensus clusters:
+consens.gr <- consens.canon.07[filter.2consecutiveStages, ] %>% GRanges()
+consens.tpm.canonical <- consensusClustersTpm(cs.canon)[filter.2consecutiveStages,]
+
+pca <- prcomp(log(0.5 + consens.tpm.canonical))
+fviz_screeplot(pca, addlabels = TRUE)
+
+```
+
+Supplementary figure 4b: (first part)
+```{r fig.width=10, fig.height=10}
+fviz_pca_var(pca, col.ind = "cos2", geom = c("point"), xlim=c(1.1, 1.9), ylim=c(-0.8, 1.3),
+             #gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE # Avoid text overlapping (slow if many points)
+             ) +  geom_point(colour="black", size=2) +
+     geom_label_repel(aes(label = rownames(pca$rotation)),
+                  box.padding   = 0.35, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50')
+```
+
+Export consensus clusters with their canonical expression normalised:
+
+```{r}
+write.table(x = cbind(as.data.frame(consens.gr), consens.tpm.canonical),
+            file = "consens.tpm.canonical.df",
+            quote = F, sep = "\t", dec = ".", col.names = TRUE)
+
+# add score as tpm/nsamples (mean tpm per sample)
+consens.gr$score <- (consens.gr$tpm / dim(consens.tpm.canonical)[2]) %>%  {if_else(condition = (. > 1000), true = 1000, false = round(.))}
+# add name as number. alternatively as as.character(grange)
+consens.gr$name <- consens.gr$consensus.cluster
+
+
+export.bb <- function(gr, file, genome="danRer10")
+{
+	require(rtracklayer)
+    # rgbitem
+    if(! is.null(strand(gr)))
+    {
+        gr$itemRgb <- ifelse(strand(gr) == "-", "#C00000", "#0000C0")
+        gr$thickStart <- start(gr)
+        gr$thickEnd <- end(gr)
+    }
+    
+	bf <- tempfile("bed", fileext = "bed")
+	bfs <- tempfile("bed", fileext = "bed")
+	export.bed(object=gr, con=bf)
+	foo <- system2("sort", c("-k1,1", "-k2,2n", bf), stdout=TRUE)
+	#foo = system2("pioSortBed", bf, stdout=TRUE)
+	#print(foo)
+	writeLines(foo, bfs)
+	# dependency: chrominfo.txt
+	system2(command="bedToBigBed", 
+	        args=c(bfs,
+	               paste0("/mnt/biggles/data/UCSC/goldenpath/", genome, "/chromInfo.sorted.txt"),
+	               file)
+	        )
+	#unlink(c(bf, bfs))
+}
+
+export.bed(consens.gr, "consens.canonical.bed", )
+export.bb(consens.gr, "consens.canonical.bigBed")  ## warning: file is .bb on the disk
+```
+
+
+```{r}
+consens.meanTpmPerStage.canonical <- map(stage2samples, function(samples)
+{
+    consens.tpm.canonical[, samples, drop=FALSE] %>% rowMeans()
+}) %>% do.call(what=cbind)
+
+write.table(x = cbind(as.data.frame(consens.gr), consens.meanTpmPerStage.canonical),
+            file = "consens.meanTpmPerStage.canonical.df",
+            quote = F, sep = "\t", dec = ".", col.names = TRUE)
+```
+
+```{r fig.width=10, fig.height=10}
+consens.tpm.canonical %>% as.data.frame() %>% as.list() %>% map(`+`, 1) %>% 
+    {
+        safeEcdf(., xlim = c(1,500), what="1-F", log="x", col=rainbow(length(.))) 
+    }
+
+```
+
+```{r}
+consens.meanLogTpmPlus05PerStage.canonical <- map(stage2samples, function(samples)
+{
+    consens.tpm.canonical[, samples, drop=FALSE] %>%
+        `+`(0.5) %>% log2 %>% rowMeans()
+}) %>% do.call(what=cbind)
+write.table(x = cbind(as.data.frame(consens.gr), consens.meanLogTpmPlus05PerStage.canonical),
+            file = "consens.meanLogTpmPlus05PerStage.canonical.df",
+            quote = F, sep = "\t", dec = ".", col.names = TRUE)
+```
+
+
+```{r}
+consens.gr %>% width %>% Ecdf(what="1-F", log="y")
+```
+So roughly an exponential decrease in consensus cluster widths.
+
+```{r}
+tss.canon.gr <-makeGRangesFromDataFrame(cs.canon@CTSScoordinates, end.field = "pos",
+                         start.field = "pos", seqinfo = seqinfo(Drerio))
+tss.canon.gr$sumNormExpr <- cs.canon@normalizedTpmMatrix %>% rowSums()
+tss.canon.gr
+```
+
+```{r fig.width=8, fig.height=7}
+## add dominantTss and dominantTssNormExpr:
+
+# extract them:
+## takes long time:
+baz <- findOverlaps(tss.canon.gr, consens.gr) %>% as_tibble() %>% 
+    mutate(sumNormExpr = tss.canon.gr[queryHits]$sumNormExpr) %>%
+    group_by(subjectHits) -> foo #%>%
+    foo %>% summarise(dominantTssI = queryHits[which.max(sumNormExpr)],
+                      sumNormExpr = sum(sumNormExpr),
+                      dominantTss = start(tss.canon.gr[dominantTssI]),
+                      dominantTssSumNormExpr = tss.canon.gr[dominantTssI]$sumNormExpr
+                     )
+
+# add these columns and remove unnecessary ones:
+
+mcols(consens.gr) <- cbind(mcols(consens.gr), baz)
+consens.gr$subjectHits <- NULL
+consens.gr$name <- NULL
+rm("baz")
+
+consens.gr
+```
+
+
+```{r fig.width=8, fig.height=7}
+smoothScatter(log10(consens.gr$sumNormExpr),
+              log10(consens.gr$dominantTssSumNormExpr), 
+              nbin=512, bandwidth = 0.005, xlab="log10 of summed expression across samples including all TSS within a cluster [tpm]",
+              ylab = "log10 of summed expression across samples of the dominant TSS [tpm]")
+
+
+```
+
+Wrong design (at least for us):
+CAGEr's function aggregateTagClusters:
+- makes consensus clusters (excluding TCs below threshold), call to .make.consensus.clusters TODO CHECK
+- when excludeSignalBelowThreshold == TRUE sums up expression from TCs (at a given stage), but excludes TCs below and all TSS which fall into a consensus cluster but are outside of any TC. THIS EFFECTIVELY TREATS CONSENSUS CLUSTERS AS DIFFERENT SETS OF TCS IN DIFFERENT STAGES.
+- when excludeSignalBelowThreshold == FALSE it sums up normalised TSS expression, but uses object@filteredCTSSidx to include only TSSs which ended up in any TCs (not all withing a cluster. why?) Calls .getTotalTagCount per sample. 
+So TSS between TCs but inside of a consensus cluster are not included in any case.
+
+
+
+debugging why tpm can be lower...
+```{r}
+  which(consens.gr$tpm < consens.gr$dominantTssSumNormExpr)
+consens.gr[6]
+
+
+```
+
+```{r}
+subsetByOverlaps(tss.canon.gr, consens.gr[6])
+
+
+cs.canon@CTSScoordinates
+```
+```{r}
+cs.foo <- cs.canon
+aggregateTagClusters(cs.foo, tpmThreshold = 1.0, excludeSignalBelowThreshold = F, qLow = NULL, qUp = NULL, maxDist = 20)
+consensusClusters(cs.foo)
+```
+
+
+```{r}
+consens.gr
+```
+
+
+# extract the full consensus clusters expression matrix including all canonical/tct initiantion. Not only the TSSs which end up in per-sample clusters.
+
+
+```{r}
+consens.tpm.canonicalEntireConsCl <- findOverlaps(tss.canon.gr, consens.gr) %>% as_tibble() %>%
+    mutate(cs.canon@normalizedTpmMatrix[queryHits, ]) %>%
+    mutate(queryHits=NULL) %>% group_by(subjectHits) %>% 
+    summarise_all(sum) %>% 
+    mutate(consensus.cluster = consens.gr$consensus.cluster[subjectHits]) %>%
+    as.data.frame() %>%
+    `rownames<-`(.$consensus.cluster) %>% {.$subjectHits = NULL; .} %>%
+    {.$consensus.cluster = NULL; .} %>% 
+    as.matrix()
+
+names(dimnames(consens.tpm.canonicalEntireConsCl)) <- list("consensus.cluster", "sample")
+
+# this is the output:
+(foo <- cbind(as.data.frame(consens.gr)[, c('seqnames', 'start', 'end', 'width', 'strand', 'consensus.cluster')],
+      consens.tpm.canonicalEntireConsCl))
+
+write.table(x = foo,
+            file = "consens.tpmPerSample.canonicalEntireConsCl.df",
+            quote = F, sep = "\t", dec = ".", col.names = TRUE)
+```
+
+And we need the same after merging replicates
+```{r fig.width=10, fig.height=10}
+consens.tpm.canonicalEntireConsCl %>% as.data.frame() %>% as.list() %>% map(`+`, 1) %>% 
+    {
+        safeEcdf(., xlim = c(1,500), what="1-F", log="x", col=rainbow(length(.))) 
+    }
+
+```
+```{r}
+consens.meanTpmPerStage.canonicalEntireConsCl <- map(stage2samples, function(samples)
+{
+    consens.tpm.canonicalEntireConsCl[, samples, drop=FALSE] %>% rowMeans()
+}) %>% do.call(what=cbind)
+
+write.table(x = cbind(as.data.frame(consens.gr)[, c('seqnames', 'start', 'end', 'width', 'strand', 'consensus.cluster')],
+                      consens.meanTpmPerStage.canonicalEntireConsCl),
+            file = "consens.meanTpmPerStage.canonicalEntireConsCl.df",
+            quote = F, sep = "\t", dec = ".", col.names = TRUE)
+```
+
+```{r}
+consens.meanLogTpmPlus05PerStage.canonicalEntireConsCl <- map(stage2samples, function(samples)
+{
+    consens.tpm.canonicalEntireConsCl[, samples, drop=FALSE] %>%
+        `+`(0.5) %>% log2 %>% rowMeans()
+}) %>% do.call(what=cbind)
+write.table(x = cbind(as.data.frame(consens.gr)[, c('seqnames', 'start', 'end', 'width', 'strand', 'consensus.cluster')],
+                      consens.meanLogTpmPlus05PerStage.canonicalEntireConsCl),
+            file = "consens.meanLogTpmPlus05PerStage.canonicalEntireConsCl.df",
+            quote = F, sep = "\t", dec = ".", col.names = TRUE)
+```
+
+```{r fig.width=10, fig.height=10}
+consens.meanTpmPerStage.canonicalEntireConsCl %>% as.data.frame() %>% as.list() %>% map(`+`, 1) %>% 
+    {
+        safeEcdf(., xlim = c(1,500), what="1-F", log="x", col=rainbow(length(.))) 
+    }
+
+```
+
+Supplementary figure 4b: (second part)
+```{r fig.width=8, fig.height=8}
+pca2 <- prcomp(consens.meanLogTpmPlus05PerStage.canonicalEntireConsCl)
+fviz_pca_var(pca2, col.ind = "cos2", geom = c("point"), xlim=c(1.5, 2.7), #ylim=c(-0.8, 1.3),
+             #gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE 
+             ) +  geom_point(colour="black", size=2) +
+     geom_label_repel(aes(label = rownames(pca2$rotation)),
+                  box.padding   = 0.35, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50')
+```
+
+Export "some" set of dominant TSSs. Needs to be post-mbt, because pre-mbt is not transcribed almost anywhere in embryo.
+```{r}
+subsetByOverlaps(
+    cbind(cs.canon@tagClusters$tagging_Prim5, cs.canon@tagClustersQuantileLow$tagging_Prim5,
+          cs.canon@tagClustersQuantileUp$tagging_Prim5
+         ) %>%
+        makeGRangesFromDataFrame(keep.extra.columns = T),
+    consens.gr) %>%
+    {
+        .$cluster.1 <- .$cluster.2 <- NULL
+        .
+    } %>%
+    saveRDS("tc.tagging_Prim5.RDS")
+
+```
+
+
+
+<H3>Consensus clusters:</H3>
+<table border="1" cellspacing="10">
+<tr>
+    <td><a href="./consens.canonical.bed">consens.canonical.bed</a></td>
+    <td>Consensus clusters built from YC+YR TSSs</td>
+    <td>BED format; SCORE is average norm expression per sample.<br>NAME is the id of the original cluster.id form the CAGEset object before filtering for expression in two consecutive stages.</td>
+</tr>
+<tr>
+    <td><a href="./consens.canonical.bigBed">consens.canonical.bigBed</a></td>
+    <td>Consensus clusters built from YC+YR TSSs</td>
+    <td>BigBed format</td>
+</tr>
+</table>
+
+
+
+<br>
+<H3>Expression per-sample (34 samples):</H3>
+<table border="1" cellspacing="10">
+<tr>
+    <td><a href="consens.tpm.canonicalEntireConsCl.df">consens.tpm.canonicalEntireConsCl.df</a></td>
+    <td>normalised expression of consensus clursters.<br>Includes all the TSSs within consensus clusters.</td>
+    <td>A data frame as text file. ROWNAMES are cluster.id as above. COLNAMES are sample names (not merged).</td>
+</tr>
+</table>
+<br>
+
+<H3>Expression per-stage (16 stages):</H3>
+<table border="1" cellspacing="10">
+<tr>
+    <td><a href="consens.meanTpmPerStage.canonicalEntireConsCl.df">consens.meanTpmPerStage.canonicalEntireConsCl.df</a></td>
+    <td>mean expression per stage. This file differs form the above deprecated one by including TSSs from the entire consensus cluster, which makes more sense</td>
+    <td>A data frame as text file. ROWNAMES are cluster.id as above. COLNAMES are stage</td>
+</tr>
+<tr>
+    <td><a href="consens.meanLogTpmPlus05PerStage.canonicalEntireConsCl.df">consens.meanLogTpmPlus05PerStage.canonicalEntireConsCl.df</a></td>
+    <td>mean log2(x + 0.5 tpm) expression per stage. For expression log-foldchange analyses. Unlike the above it contains all TSSs within a consensus cluster</td>
+    <td>A data frame as text file. ROWNAMES are cluster.id as above. COLNAMES are sample names</td>
+
+</table>
+
+Produce per-stage TCs for some statistics in the paper.
+CAGEr function mergeReplicates is intended to run before normalisation.
+We can do it "by hand" by updating all the slots
+
+```{r}
+
+
+mergeReplicatesPiotr <- function(cs, grouping)
+{
+    ret <- cs
+    #ret@tagClusters <- NULL
+    
+    #@librarySizes
+    ret@librarySizes <- imap(stage2samples, function(samples, stage)
+    {
+        sum(cs@librarySizes[samples])
+    }) %>% do.call(what=c)
+
+    #@sampleLabels, ignores names which seem to be RGBA
+    ret@sampleLabels <- names(stage2samples)    
+    
+    #@tagCountMatrix
+    ret@tagCountMatrix <- imap(stage2samples, function(samples, stage)
+    {
+        rowSums(cs@tagCountMatrix[, samples, drop=F])
+    }) %>% do.call(what=cbind.data.frame)
+
+    # normalizedTpmMatrix needs to be a weighted average of tpms. 
+    nTSS <- dim(cs@normalizedTpmMatrix)[1]
+    
+    ret@normalizedTpmMatrix <- imap(stage2samples, function(samples, stage)
+    {
+        (cs@normalizedTpmMatrix[, samples, drop=F] *
+            matrix(rep(cs@librarySizes[samples]/sum(cs@librarySizes[samples]), each=nTSS),
+                   nrow = nTSS)) %>%
+            rowSums()
+    }) %>% do.call(what=cbind.data.frame)
+
+    return(ret)
+}
+
+cs.canon.merged <- mergeReplicatesPiotr(cs.canon, stage2samples)
+
+plan(multisession, workers=16)
+# just one test:
+options(future.globals.maxSize= 9 * 1024^3)  # 9 GB of globals to the function
+
+clusterCTSS(cs.canon.merged, threshold = 0.7, thresholdIsTpm = TRUE, nrPassThreshold = 1,
+            method = "distclu", maxDist = 20, removeSingletons = TRUE, 
+            keepSingletonsAbove = 5, useMulticore = T, nrCores = 16)
+plan(sequential)
+saveRDS(cs.canon.merged, "cs.canon.merged.RDS")
+
+# this is to verify that there was no change in cs.canon and we get the same number of clusters as previously.
+# We do!
+#cs.tmp <- cs.canon
+#clusterCTSS(cs.tmp, threshold = 0.7, thresholdIsTpm = TRUE, nrPassThreshold = 1,
+#            method = "distclu", maxDist = 20, removeSingletons = TRUE, 
+#            keepSingletonsAbove = 5, useMulticore = T, nrCores = 16)
+#all.equal(cs.tmp@tagClusters %>% map(~dim(.)[1]) %>% do.call(what=c), (cs.canon@tagClusters %>% map(~dim(.)[1]) %>% #do.call(what=c)))
+#[1] TRUE
+#rm("cs.tmp")
+```
+Slots relating to consensus clusters, input filenames are not valid.
+
+```{r}
+par(mar=c(12, 5, 1, 1))
+cs.canon.merged@tagClusters %>% map(~dim(.)[1]) %>% do.call(what=c) %>% barplot(las=2)
+cs.canon@tagClusters %>% map(~dim(.)[1]) %>% do.call(what=c) %>% barplot(las=2)
+
+```
+
+
+I merged samples (tagcounts by summing and normalised expression by weighted means) and ran tag clustering on the resulting CAGEset object using the same parameters as previously:
+
+threshold = 0.7
+thresholdIsTpm = TRUE
+nrPassThreshold = 1
+method = "distclu"
+maxDist = 20
+removeSingletons = TRUE
+keepSingletonsAbove = 5
+
+Since tag counts per stage are sums of tag counts of corresponding samples, the last parameter will result in more singletons being kept on average.
+
+A feature/bug of CAGEr is the nrPassThreshold parameter, which sets the minimal number of experiments (or stages in this case) where TSS must be expressed above the threshold to include the CTSS in clustering at all.
+The effect of it is seen in 1:1 cases (for instance only one s1_cell sample). The numbers of produced TCs differ despite tag counts and normalised expression stay the same.
+There are 23435 TCs in tagging_1_cell, but only 19878 in s1_cell ! The reason is the merging of the remaining samples.
+
+The number of TCs obtained this way is:
+
+	-> fert_egg: 21624
+ 	-> s1_cell: 19878
+ 	-> s16_cell: 19506
+ 	-> s64_cell: 19940
+ 	-> s128_cell: 18877
+ 	-> s512_cell: 21497
+ 	-> high: 19501
+ 	-> oblong: 19217
+ 	-> sphere: 20603
+ 	-> s30pc_epi: 23017
+ 	-> shield: 18079
+ 	-> s4_somites: 18513
+ 	-> s14_19_somites: 20691
+ 	-> prim5: 24614
+ 	-> prim25: 21576
+ 	-> longPec: 23123
+
+```{r get dinucleotide distributions}
+dinuc.mat.canon <- getDinuc2(cs.canon, filterBad = T) %>% apply(2, function(r)
+{
+  r / sum(r)  
+}) %>% t()
+
+dinuc.mat.canon.merged <- getDinuc2(cs.canon.merged, filterBad = T) %>% apply(2, function(r)
+{
+  r / sum(r)  
+}) %>% t()
+
+dinuc.mat.Grm <- getDinuc2(cs.Grm, filterBad = T) %>% apply(2, function(r)
+{
+  r / sum(r)  
+}) %>% t()
+
+saveRDS(dinuc.mat.canon, "dinuc.mat.canon.RDS")
+saveRDS(dinuc.mat.canon.merged, "dinuc.mat.canon.merged.RDS")
+saveRDS(dinuc.mat.Grm, "dinuc.mat.Grm.RDS")
+```
+
