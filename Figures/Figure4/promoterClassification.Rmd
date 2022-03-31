@@ -20,7 +20,7 @@ library(Hmisc)
 library(stringr)
 require(GenomicFeatures)
 # dependency: transcript database (for annotation)
-txDb <- loadDb("/mnt/biggles/csc_home/piotr/Work/BbsrcGeneral/TxDb/txDb.ucsc.danRer10.sqlite")
+txDb <- makeTxDbFromUCSC(genome="danRer10", tablename="ensGene") 
 library( "biomaRt" )
 mart <- useEnsembl(biomart = "ensembl", 
                    dataset = "drerio_gene_ensembl", 
